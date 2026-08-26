@@ -9,8 +9,8 @@ data owner.
 
 - `input_tables/`: segment, reference-edge, junction, source/sink, and
   CNV/SV-boundary tables from the source-preserving balance.
-- `flow/`: original oriented gGnome peel topology and the capacity-reweighted
-  walk-node table used by this evaluation.
+- `flow/`: oriented gGnome peel walks reconstructed directly from the
+  source-preserving balanced graph, including node, edge, and walk summaries.
 - `results/chr18.copy_flow_additive.npz`: O/E, expected components, copy-pair
   pools, external fit, and 500-kb Pearson matrix.
 - `results/chr18.copy_flow_additive.png`: O/E and component diagnostic figure.
@@ -18,12 +18,21 @@ data owner.
 
 ## Important limitation
 
-The source-preserving JCN solution was not completely re-peeled because the
-local R environment lacked an installed gGnome package. Instead, the previous
-oriented walk topology was capacity-reweighted using the minimum new/old edge
-capacity on each walk. Removed flow remains source/sink flow. These files are a
-sensitivity result, not a final derivative-allele reconstruction or CALDER
-input.
+The source-preserving graph was newly decomposed with `gGnome::peel`: 66
+complete walks were exported, including four circular walks. A final 0.67 CN
+of open/source flow could not be peeled into a complete derivative walk and
+was deliberately left as source residual rather than absorbed into an SV.
+The external-contact model is still a global power law and fitted at the lower
+beta bound in this example, so this remains a diagnostic result rather than a
+recommended CALDER input.
+
+The additive model uses pair-pool-consistent units:
+
+```text
+cis molecule multiplicity: M / P
+total copy-pair pool:       CN_i CN_j / P^2
+external copy-pair pool:    (CN_i CN_j - M) / P^2
+```
 
 The NPZ arrays are:
 

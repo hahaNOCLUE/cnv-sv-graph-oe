@@ -94,6 +94,12 @@ def accumulate_oriented_walks(bins: pd.DataFrame, walk_nodes: pd.DataFrame,
             distance = np.minimum(distance, length - distance)
         distance_bins = np.clip(np.rint(distance / resolution).astype(int),
                                 0, len(native_decay) - 1)
+        # Two distinct reference bins cannot occupy the same physical locus on
+        # a derivative molecule.  Sub-bin breakpoint offsets may round to zero,
+        # but using P(0) there would import the much larger self-contact term.
+        off_diagonal = ids[:, None] != ids[None, :]
+        distance_bins[off_diagonal] = np.maximum(
+            distance_bins[off_diagonal], 1)
         copy = float(walk["walk_cn"].iloc[0]) / ploidy
         rows = np.broadcast_to(ids[:, None], distance_bins.shape).ravel()
         cols = np.broadcast_to(ids[None, :], distance_bins.shape).ravel()
@@ -146,10 +152,16 @@ def compute_copy_flow_additive_oe(
         bins, walk_nodes, native_decay, resolution, ploidy)
     dosage = np.maximum(np.asarray(segment_cn, float) / ploidy, 0)
     total_pairs = np.outer(dosage, dosage)
-    cis_pairs = np.minimum(raw_cis_pairs, total_pairs)
-    scale = np.divide(cis_pairs, raw_cis_pairs, out=np.zeros_like(cis_pairs),
+    # raw_cis_pairs is a relative molecule multiplicity M/P, whereas
+    # total_pairs is a relative copy-pair pool CN_i*CN_j/P^2.  Cap M/P by the
+    # copies available at either endpoint; do not compare it to total_pairs.
+    max_cis_rel = np.minimum(dosage[:, None], dosage[None, :])
+    cis_rel = np.minimum(raw_cis_pairs, max_cis_rel)
+    scale = np.divide(cis_rel, raw_cis_pairs, out=np.zeros_like(cis_rel),
                       where=raw_cis_pairs > 0)
     cis_expected *= scale
+    # Convert M/P to the same pair units as CN_i*CN_j/P^2 before subtraction.
+    cis_pairs = cis_rel / ploidy
     external_pairs = np.maximum(total_pairs - cis_pairs, 0)
     if external_level is None:
         if external_fit_mask is None:

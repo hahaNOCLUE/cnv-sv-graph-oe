@@ -122,7 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contact-graph-strength", type=float, default=0.0,
                         help="Precision multiplier for the global contact graph")
     parser.add_argument("--sv-distance-oe", action="store_true", default=False,
-                        help="Use confidence/CN-weighted single-SV graph distances in O/E expected")
+                        help="Use the legacy confidence/CN shortest-distance mixture O/E")
+    parser.add_argument(
+        "--copy-flow-walks", default=None,
+        help="gGnome peel walk-node TSV; enables oriented additive copy-flow O/E",
+    )
     parser.add_argument("--sv-max-hops", type=int, default=0,
                         help="Maximum SV edges per distance path; 0 means unlimited (default: 0)")
     parser.add_argument("--is-microc", action="store_true", default=True, help="Micro-C flag (default: True)")
@@ -203,6 +207,7 @@ def main() -> None:
         contact_graph_signed=args.contact_graph_signed,
         contact_graph_strength=args.contact_graph_strength,
         sv_distance_oe=args.sv_distance_oe,
+        copy_flow_walks=args.copy_flow_walks,
         sv_max_hops=None if args.sv_max_hops == 0 else args.sv_max_hops,
         is_microc=args.is_microc,
         balance=args.balance,
