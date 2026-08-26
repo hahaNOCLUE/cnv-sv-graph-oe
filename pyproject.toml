@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cnv-latent-ssm"
+version = "0.1.0"
+description = "CNV-aware Latent Chromatin State Model for Continuous Compartment Calling in Cancer Genomes"
+authors = [{ name = "Computational Biology Team" }]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20",
+    "scipy>=1.7",
+    "pandas>=1.3",
+    "scikit-learn>=1.0",
+    "cooler>=0.8.11",
+    "matplotlib>=3.4",
+]
+
+[project.scripts]
+cnv-ssm = "cnv_latent_ssm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

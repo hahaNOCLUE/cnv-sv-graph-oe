@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Local data and analysis products
+*.cool
+*.mcool
+*.hic
+*.pairs
+*.pairs.gz
+*.pairix.gz
+*.npz
+*.npy
+*.png
+*.pdf
+*.log
+result*/
+outputs*/
