@@ -130,13 +130,14 @@ def compute_sv_distance_mixture_oe(
     matrix: np.ndarray,
     valid_mask: np.ndarray,
     sv_edges: list,
-    max_sv_hops: int = 3,
+    max_sv_hops: Optional[int] = None,
     return_diagnostics: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """O/E with confidence-weighted multi-SV effective distances.
 
     ``sv_edges`` contains ``(u, v, pi)`` tuples, where ``pi`` combines SV-call
-    confidence and endpoint dosage.  Paths can use up to ``max_sv_hops`` SV
+    confidence and endpoint dosage.  Paths can optionally use up to
+    ``max_sv_hops`` SV
     edges, which lets nearby/compound SVs jointly affect a contact block.
     Linear genomic segments remain unit-cost edges.  Among equally short paths,
     the path with the largest *bottleneck* SV weight is retained.  The
@@ -147,7 +148,7 @@ def compute_sv_distance_mixture_oe(
     chromosome-wide shortcuts.  Set ``return_diagnostics`` to obtain reference
     and effective distances, SV-hop counts, and the retained mixture weight.
     """
-    if max_sv_hops < 1:
+    if max_sv_hops is not None and max_sv_hops < 1:
         raise ValueError("max_sv_hops must be at least 1")
 
     n = matrix.shape[0]
@@ -162,7 +163,7 @@ def compute_sv_distance_mixture_oe(
     idx = np.arange(n)
     d_ref = np.abs(idx[:, None] - idx[None, :]).astype(np.int32)
     d_sv = d_ref.copy()
-    hops = np.zeros((n, n), dtype=np.int8)
+    hops = np.zeros((n, n), dtype=np.int16)
     strength = np.ones((n, n), dtype=np.float32)
 
     cleaned_edges = []
@@ -172,10 +173,11 @@ def compute_sv_distance_mixture_oe(
             continue
         cleaned_edges.append((u, v, float(np.clip(pi, 0.0, 1.0))))
 
-    # Repeated relaxation permits compound paths while retaining the explicit
-    # SV-hop cap.  At most max_sv_hops passes are needed to introduce a path
-    # containing that many SV edges.
-    for _ in range(max_sv_hops):
+    # With no explicit cap, n-1 relaxation passes cover every simple path.
+    # A finite cap remains useful as a sensitivity diagnostic, but is no longer
+    # silently fixed at three hops.
+    hop_limit = (max(n - 1, 1) if max_sv_hops is None else max_sv_hops)
+    for _ in range(hop_limit):
         changed = False
         for u, v, pi in cleaned_edges:
             for left, right in ((u, v), (v, u)):
@@ -189,7 +191,7 @@ def compute_sv_distance_mixture_oe(
                     np.minimum(strength[:, left, None], pi),
                     strength[right, None, :],
                 )
-                usable = candidate_hops <= max_sv_hops
+                usable = candidate_hops <= hop_limit
                 better = usable & (
                     (candidate_distance < d_sv)
                     | (
@@ -256,7 +258,8 @@ def compute_interaction_profile_correlation(
     normalized = centered / stds
 
     # Pearson correlation via matrix multiplication
-    corr_valid = np.dot(normalized, normalized.T) / (normalized.shape[1] - 1)
+    # np.std above uses ddof=0, hence each standardized row has squared norm n.
+    corr_valid = np.dot(normalized, normalized.T) / normalized.shape[1]
     corr_valid = np.clip(corr_valid, -1.0, 1.0)
     np.fill_diagonal(corr_valid, 1.0)
 

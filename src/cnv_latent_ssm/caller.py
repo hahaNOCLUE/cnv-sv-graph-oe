@@ -82,8 +82,8 @@ def load_sv_endpoint_breakpoints(
     breakpoints = np.zeros(len(bins_df), dtype=bool)
     edges = []
     for row in sv.itertuples(index=False):
-        i = int(np.clip(np.searchsorted(starts, int(row.pos1), side="left"), 0, len(starts) - 1))
-        j = int(np.clip(np.searchsorted(starts, int(row.pos2), side="left"), 0, len(starts) - 1))
+        i = int(np.clip(np.searchsorted(starts, int(row.pos1), side="right") - 1, 0, len(starts) - 1))
+        j = int(np.clip(np.searchsorted(starts, int(row.pos2), side="right") - 1, 0, len(starts) - 1))
         breakpoints[i] = True
         breakpoints[j] = True
         edges.append((i, j))
@@ -103,8 +103,8 @@ def load_sv_distance_edges(
     probability_cols = [c for c in ["++", "+-", "-+", "--"] if c in sv.columns]
     edges = []
     for _, row in sv.iterrows():
-        i = int(np.clip(np.searchsorted(starts, int(row["pos1"]), side="left"), 0, len(starts)-1))
-        j = int(np.clip(np.searchsorted(starts, int(row["pos2"]), side="left"), 0, len(starts)-1))
+        i = int(np.clip(np.searchsorted(starts, int(row["pos1"]), side="right") - 1, 0, len(starts)-1))
+        j = int(np.clip(np.searchsorted(starts, int(row["pos2"]), side="right") - 1, 0, len(starts)-1))
         confidence = max(float(row[c]) for c in probability_cols) if probability_cols else 1.0
         dosage = float(np.sqrt(max(cn_relative[i], 0.0) * max(cn_relative[j], 0.0)))
         pi = confidence * dosage / (1.0 + dosage)
@@ -307,6 +307,7 @@ def run_cnv_latent_ssm(
     contact_graph_signed: bool = False,
     contact_graph_strength: float = 0.0,
     sv_distance_oe: bool = False,
+    sv_max_hops: Optional[int] = None,
     is_microc: bool = True,
     balance: bool = False,
     decouple_breakpoints: bool = True,
@@ -412,7 +413,7 @@ def run_cnv_latent_ssm(
     valid_mask = identify_valid_bins(
         raw_matrix,
         bins_df=bins_df,
-        require_balancing_weight=True,
+        require_balancing_weight=balance,
     )
 
     # 2. Phasing track loading
@@ -459,6 +460,7 @@ def run_cnv_latent_ssm(
                     len(sv_distance_edges))
         oe_matrix = compute_sv_distance_mixture_oe(
             raw_matrix, valid_mask=valid_mask, sv_edges=sv_distance_edges,
+            max_sv_hops=sv_max_hops,
         )
     else:
         oe_matrix = compute_observed_over_expected(raw_matrix, valid_mask=valid_mask)

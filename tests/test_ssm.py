@@ -292,6 +292,36 @@ def test_eaglec2_sv_endpoints_become_ar_boundaries(tmp_path):
     assert np.flatnonzero(bp).tolist() == [2, 6]
 
 
+def test_sv_endpoint_inside_bin_maps_to_containing_bin(tmp_path):
+    import pandas as pd
+
+    sv = tmp_path / "calls.txt"
+    sv.write_text(
+        "chrom1\tpos1\tchrom2\tpos2\n"
+        "chr18\t120000\tchr18\t389999\n"
+    )
+    bins = pd.DataFrame({
+        "chrom": ["chr18"] * 10,
+        "start": np.arange(10) * 50000,
+        "end": (np.arange(10) + 1) * 50000,
+    })
+    bp, edges = load_sv_endpoint_breakpoints(str(sv), "chr18", bins)
+    assert edges == [(2, 7)]
+    assert np.flatnonzero(bp).tolist() == [2, 7]
+
+
+def test_pearson_uses_consistent_population_standardization():
+    from cnv_latent_ssm.features import compute_interaction_profile_correlation
+
+    matrix = np.array([[1., 2., 4.], [2., 1., 0.], [4., 0., 2.]])
+    observed = compute_interaction_profile_correlation(
+        matrix, np.ones(3, dtype=bool), log_transform=False,
+        winsorize_quantile=1.0,
+    )
+    expected = np.corrcoef(matrix)
+    np.testing.assert_allclose(observed, expected)
+
+
 def test_sv_edges_are_weighted_by_endpoint_copy_dosage():
     weighted, table = weight_sv_edges_by_cnv(
         [(0, 1), (2, 3)], np.array([1.0, 1.0, 4.0, 4.0])
