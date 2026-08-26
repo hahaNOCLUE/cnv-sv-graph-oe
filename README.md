@@ -64,3 +64,26 @@ Hi-C / Micro-C ──────┼── Internal CNV (1D Coverage -> GAM/Poly
 - `*.parameters.tsv`: Estimated parameters ($F, Q, R, H, G$, log-likelihood, iterations).
 - `*.qc.tsv`: Quantitative metrics (CNV correlation decoupling, gene density concordance, posterior uncertainty).
 - `*.summary.png`: Multi-track visualization comparing input PCs, CNV, SSM trajectory with uncertainty ribbon, and loading decomposition.
+
+---
+
+## Copy-flow additive expected contacts
+
+`cnv_latent_ssm.graph_expected` implements the rearranged-genome expected model
+
+$$
+E_{ij}=\sum_p M_{ij,p}P_{\rm native}(d_{ij,p})
+       +(D_{ij}-M_{ij})^{\beta}P_{\rm ext},
+\qquad D_{ij}=\frac{CN_iCN_j}{P^2}.
+$$
+
+Its input is an oriented derivative-walk decomposition with explicit `strand`
+and `walk_cn`. Consequently, junction dosage comes from the upstream JCN/flow
+solution, deletion and inversion paths retain their physical orientation, and
+multiple alleles are summed rather than collapsed to one shortest path. Source
+or sink CN remains outside the derivative walks and therefore cannot create an
+SV contact contribution.
+
+The older `compute_sv_distance_mixture_oe()` function is retained only for
+backward compatibility and hop-cap sensitivity diagnostics. It is not the
+recommended model for complex cancer genomes.

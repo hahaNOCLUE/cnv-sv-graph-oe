@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -148,6 +149,11 @@ def compute_sv_distance_mixture_oe(
     chromosome-wide shortcuts.  Set ``return_diagnostics`` to obtain reference
     and effective distances, SV-hop counts, and the retained mixture weight.
     """
+    warnings.warn(
+        "compute_sv_distance_mixture_oe is a legacy shortest-path heuristic; "
+        "use graph_expected.compute_copy_flow_additive_oe for oriented JCN flows",
+        DeprecationWarning, stacklevel=2,
+    )
     if max_sv_hops is not None and max_sv_hops < 1:
         raise ValueError("max_sv_hops must be at least 1")
 

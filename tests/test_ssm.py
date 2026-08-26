@@ -1,9 +1,15 @@
 """Unit tests for CNV-aware Latent SSM."""
 
 import numpy as np
+import pandas as pd
 import pytest
 from scipy import stats
 from cnv_latent_ssm.ssm import CNVAwareSSM
+from cnv_latent_ssm.graph_expected import (
+    accumulate_oriented_walks,
+    compute_copy_flow_additive_oe,
+    flow_residuals,
+)
 from cnv_latent_ssm.caller import (
     build_contact_knn_graph,
     identify_transition_breakpoints,
@@ -320,6 +326,72 @@ def test_pearson_uses_consistent_population_standardization():
     )
     expected = np.corrcoef(matrix)
     np.testing.assert_allclose(observed, expected)
+
+
+def test_oriented_deletion_walk_uses_direct_graph_adjacency():
+    bins = pd.DataFrame({
+        "start": np.arange(6) * 50_000,
+        "end": (np.arange(6) + 1) * 50_000,
+    })
+    # The derivative allele joins bins 1 and 4 and skips bins 2-3.
+    walks = pd.DataFrame({
+        "walk_id": [1, 1], "walk_cn": [1., 1.],
+        "circular": [False, False], "order": [1, 2],
+        "start": [0, 200_000], "end": [100_000, 300_000],
+        "strand": ["+", "+"],
+    })
+    decay = np.array([100., 50., 25., 12.5, 6.25, 3.125])
+    expected, copies = accumulate_oriented_walks(
+        bins, walks, decay, resolution=50_000, ploidy=2.)
+    np.testing.assert_allclose(copies[1, 4], .5)
+    np.testing.assert_allclose(expected[1, 4], .5 * decay[1])
+
+
+def test_copy_flow_expected_sums_multiple_paths_instead_of_shortest_only():
+    bins = pd.DataFrame({"start": np.arange(3) * 50_000,
+                         "end": (np.arange(3) + 1) * 50_000})
+    walks = pd.DataFrame({
+        "walk_id": [1, 1, 2, 2, 2],
+        "walk_cn": [1., 1., 1., 1., 1.],
+        "circular": [False] * 5, "order": [1, 2, 1, 2, 3],
+        "start": [0, 100_000, 0, 50_000, 100_000],
+        "end": [50_000, 150_000, 50_000, 100_000, 150_000],
+        "strand": ["+"] * 5,
+    })
+    decay = np.array([100., 40., 10.])
+    expected, copies = accumulate_oriented_walks(
+        bins, walks, decay, resolution=50_000, ploidy=2.)
+    # One half-copy path has d=1 and another half-copy path has d=2.
+    np.testing.assert_allclose(expected[0, 2], .5 * 40. + .5 * 10.)
+    np.testing.assert_allclose(copies[0, 2], 1.)
+
+
+def test_additive_expected_partitions_total_copy_pair_pool():
+    bins = pd.DataFrame({"start": [0, 50_000], "end": [50_000, 100_000]})
+    walks = pd.DataFrame({
+        "walk_id": [1, 1], "walk_cn": [1., 1.],
+        "circular": [False, False], "order": [1, 2],
+        "start": [0, 50_000], "end": [50_000, 100_000],
+        "strand": ["+", "+"],
+    })
+    matrix = np.array([[20., 10.], [10., 20.]])
+    _, result = compute_copy_flow_additive_oe(
+        matrix, bins, np.ones(2, bool), np.array([2., 2.]), walks,
+        np.array([20., 10.]), 50_000, external_level=2., external_beta=1.)
+    np.testing.assert_allclose(
+        result.cis_copy_pairs + result.external_copy_pairs,
+        result.total_copy_pairs)
+    np.testing.assert_allclose(result.expected,
+                               result.cis_expected + result.external_expected)
+
+
+def test_source_flow_is_not_absorbed_into_junction_flow():
+    residual = flow_residuals(
+        np.array([2., 3.]),
+        np.array([[.4, .5], [.7, .8]]),
+        np.array([[1.6, 1.5], [2.3, 2.2]]),
+    )
+    np.testing.assert_allclose(residual, 0.)
 
 
 def test_sv_edges_are_weighted_by_endpoint_copy_dosage():
