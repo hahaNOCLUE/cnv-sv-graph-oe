@@ -1,0 +1,27 @@
+sequence_cn_source	CNVkit CBS .cns
+sequence_cn_conversion	CN=ploidy*2^log2
+nominal_ploidy	2.0
+sequence_cn_optimization	fixed
+sv_read_likelihood	Poisson
+chromosome	chr18
+parent_cnv_segments	27
+graph_sequence_segments	37
+sv_edges	12
+cnv_snap_tolerance_bp	100000
+cnv_snap_min_jump	0.25
+cnv_snapped_boundaries	14
+flow_weight	100000.0
+source_penalty	0.0
+junction_penalty	0.1
+junction_target_weight	25.0
+junction_target_mode	upper
+junction_target_rule	min(max_endpoint_CBS_CN_jump,endpoint_capacity)
+poisson_weight	1.0
+junction_window_bp	1000
+sv_reads_per_cn	10.084508750052006
+sv_reads_per_cn_source	sampled_normal_chr18_matched_windows
+reference_reads_per_cn	11.550920403369048
+solver_status	The relative change of the cost function is less than `tol`.
+max_flow_residual_cn	0.001647187721
+total_junction_cn	4.404448247
+total_source_cn	33.08079791
