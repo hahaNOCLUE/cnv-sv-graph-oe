@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""Balance chr18 junction CN against fixed CNVkit CBS continuous CN."""
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from scipy.optimize import lsq_linear, minimize
+
+ORIENTATIONS = ("++", "+-", "-+", "--")
+
+def get_args():
+    root = Path("/home/dell/a1/microc")
+    p = argparse.ArgumentParser()
+    p.add_argument("--cnv", type=Path, default=root / "result_2/compartment/CNVkit_F1_50kb/F1_50kb.cbs.cns")
+    p.add_argument("--cnr", type=Path, default=root / "result_2/compartment/CNVkit_F1_50kb/F1_50kb.continuous.cnr",
+                   help="Pre-CBS CNVkit bins to overlay on the CN panel")
+    p.add_argument("--sv", type=Path, default=root / "result_2/EagleC2/F1/F1_chr18_50kb_EagleC2_SVs_raw.SV_calls.txt")
+    p.add_argument("--outdir", type=Path, default=root / "result_2/compartment/chr18_cnv_jcn_balance")
+    p.add_argument("--chrom", default="chr18")
+    p.add_argument("--ploidy", type=float, default=2.0,
+                   help="Nominal scale for CNVkit log2 ratio: CN=P*2**log2")
+    p.add_argument("--flow-weight", type=float, default=1e8,
+                   help="Near-hard side-flow conservation weight")
+    p.add_argument("--source-penalty", type=float, default=1000.0,
+                   help="Penalty for source flow at ordinary internal segment sides")
+    p.add_argument("--breakpoint-source-penalty", type=float, default=10.0,
+                   help="Reduced source penalty at an EagleC2 breakend")
+    p.add_argument("--telomere-source-penalty", type=float, default=0.0,
+                   help="Source penalty at chromosome telomeres")
+    p.add_argument("--junction-penalty", type=float, default=0.1)
+    p.add_argument("--junction-target-weight", type=float, default=25.0,
+                   help="Global weight for CNV-breakpoint-derived junction dosage")
+    p.add_argument("--junction-target-mode", choices=("upper", "equality"),
+                   default="upper",
+                   help="Treat CNV jumps as an upper guide, not forced SV dosage")
+    p.add_argument("--poisson-weight",type=float,default=1.0)
+    p.add_argument("--junction-window",type=int,choices=(500,1000,1500,5000),default=None,
+                   help="Use the matched small-window comparison counts")
+    p.add_argument("--cnv-snap-tolerance",type=int,default=100_000)
+    p.add_argument("--cnv-snap-min-jump",type=float,default=.25)
+    return p.parse_args()
+
+def endpoint_vertex(pos, strand, starts, ends):
+    pos = int(pos)
+    if strand == "+":
+        found = np.flatnonzero(ends <= pos)
+        i = int(found[-1]) if len(found) else 0
+        return 2 * i + 1, i, "R"
+    found = np.flatnonzero(starts >= pos)
+    i = int(found[0]) if len(found) else len(starts) - 1
+    return 2 * i, i, "L"
+
+def main():
+    a = get_args(); a.outdir.mkdir(parents=True, exist_ok=True)
+    cns = pd.read_csv(a.cnv, sep="\t", comment="#")
+    parent = cns[cns.chromosome.astype(str).eq(a.chrom)].copy().sort_values("start").reset_index(drop=True)
+    if parent.empty: raise ValueError(f"no {a.chrom} records in {a.cnv}")
+    parent["chrom"] = parent.chromosome.astype(str)
+    parent["copy_number"] = a.ploidy * np.exp2(pd.to_numeric(parent.log2, errors="raise"))
+    sv = pd.read_csv(a.sv, sep="\t")
+    sv = sv[(sv.chrom1 == a.chrom) & (sv.chrom2 == a.chrom)].copy().reset_index(drop=True)
+    probabilities = sv.loc[:, ORIENTATIONS].astype(float)
+    sv["orientation"] = probabilities.idxmax(axis=1)
+    sv["eaglec2_probability"] = probabilities.max(axis=1)
+    sv["sv_id"] = [f"SV{i+1:02d}" for i in range(len(sv))]
+
+    # Snap a nearby CBS boundary to an SV endpoint only when pre-CBS bins show
+    # a sustained local CN transition. This treats 50-kb calls at their actual
+    # resolution while using one global rule for every endpoint.
+    raw_bins=pd.read_csv(a.cnr,sep="\t",comment="#")
+    raw_bins=raw_bins[raw_bins.chromosome.astype(str).eq(a.chrom)].copy()
+    raw_bins["copy_number"]=a.ploidy*np.exp2(pd.to_numeric(raw_bins.log2,errors="coerce"))
+    endpoint_values=sorted(set(sv.pos1.astype(int))|set(sv.pos2.astype(int)))
+    snap_rows=[]
+    for i in range(1,len(parent)):
+        boundary=int(parent.loc[i,"start"])
+        candidates=[p for p in endpoint_values if abs(p-boundary)<=a.cnv_snap_tolerance]
+        scored=[]
+        for p in candidates:
+            left=raw_bins[(raw_bins.end<=p)&(raw_bins.end>p-100_000)].copy_number
+            right=raw_bins[(raw_bins.start>=p)&(raw_bins.start<p+100_000)].copy_number
+            if len(left)>=2 and len(right)>=2:
+                jump=abs(float(np.median(right))-float(np.median(left)))
+                scored.append((jump,-abs(p-boundary),p,float(np.median(left)),float(np.median(right))))
+        if not scored: continue
+        jump,_,p,left_cn,right_cn=max(scored)
+        if jump<a.cnv_snap_min_jump: continue
+        parent.loc[i-1,"end"]=p; parent.loc[i,"start"]=p
+        snap_rows.append({"original_cbs_boundary":boundary,"snapped_boundary":p,"distance_bp":p-boundary,
+                          "raw_left_median_cn":left_cn,"raw_right_median_cn":right_cn,"raw_cn_jump":jump})
+    pd.DataFrame(snap_rows).to_csv(a.outdir/"F1_chr18.cnv_sv_boundary_matches.tsv",sep="\t",index=False)
+
+    cuts = set(parent.start.astype(int)) | set(parent.end.astype(int))
+    cuts |= set(sv.pos1.astype(int)) | set(sv.pos2.astype(int))
+    records = []
+    for i, row in parent.iterrows():
+        local = sorted(c for c in cuts if int(row.start) <= c <= int(row.end))
+        for start, end in zip(local, local[1:]):
+            if start < end:
+                records.append({"segment_id": f"SEQ{len(records)+1:03d}", "chrom": a.chrom,
+                    "start": start, "end": end, "parent_cnv_segment": f"CNSEG{i+1:03d}",
+                    "sequence_cn": float(row.copy_number)})
+    segments = pd.DataFrame(records)
+    starts, ends = segments.start.to_numpy(int), segments.end.to_numpy(int)
+    seq_cn = segments.sequence_cn.to_numpy(float)
+    nseg, nv, nr, nj = len(segments), 2*len(segments), len(segments)-1, len(sv)
+
+    # Variables are reference CN, junction CN and source CN; sequence CN is fixed.
+    off_ref, off_j, off_src = 0, nr, nr+nj
+    incident = [[] for _ in range(nv)]
+    for i in range(nr):
+        incident[2*i+1].append(off_ref+i); incident[2*(i+1)].append(off_ref+i)
+    edge_vertices = []
+    junction_targets = []
+    def cn_jump_at(position):
+        left = np.flatnonzero(ends <= int(position))
+        right = np.flatnonzero(starts >= int(position))
+        if not len(left) or not len(right): return 0.0
+        return abs(seq_cn[int(left[-1])] - seq_cn[int(right[0])])
+    for j, row in sv.iterrows():
+        v1,b1,s1 = endpoint_vertex(row.pos1,row.orientation[0],starts,ends)
+        v2,b2,s2 = endpoint_vertex(row.pos2,row.orientation[1],starts,ends)
+        incident[v1].append(off_j+j); incident[v2].append(off_j+j)
+        edge_vertices.append((v1,v2,b1,b2,s1,s2))
+        capacity = min(seq_cn[b1], seq_cn[b2])
+        junction_targets.append(min(max(cn_jump_at(row.pos1), cn_jump_at(row.pos2)), capacity))
+
+    # Source/sink is a last-resort residual. Ordinary internal sides should
+    # continue through their reference edge; only called breakends and true
+    # chromosome ends receive reduced source penalties.
+    breakend_vertices = {vertex for edge in edge_vertices for vertex in edge[:2]}
+    source_weights = np.full(nv, a.source_penalty, dtype=float)
+    source_weights[list(breakend_vertices)] = a.breakpoint_source_penalty
+    source_weights[[0, nv - 1]] = a.telomere_source_penalty
+
+    rr=[]; cc=[]; vv=[]; rhs=[]
+    def add(coeffs,target):
+        r=len(rhs)
+        for c,v in coeffs: rr.append(r); cc.append(c); vv.append(v)
+        rhs.append(float(target))
+    fw=np.sqrt(a.flow_weight)
+    for vertex in range(nv):
+        coeffs=[(edge,fw) for edge in incident[vertex]]+[(off_src+vertex,fw)]
+        add(coeffs,fw*seq_cn[vertex//2])
+    for vertex, penalty in enumerate(source_weights):
+        if penalty > 0:
+            add([(off_src+vertex,np.sqrt(penalty))],0)
+    for j,p in enumerate(sv.eaglec2_probability):
+        add([(off_j+j,np.sqrt(a.junction_penalty/max(float(p),.05)))],0)
+        if a.junction_target_mode == "equality":
+            tw = np.sqrt(a.junction_target_weight * max(float(p), .05))
+            add([(off_j+j,tw)], tw*junction_targets[j])
+    design=sparse.csr_matrix((vv,(rr,cc)),shape=(len(rhs),off_src+nv))
+    dense=design.toarray(); target_vector=np.asarray(rhs)
+    fit=lsq_linear(dense,target_vector,bounds=(0,np.inf),method="bvls",tol=1e-12,max_iter=10000)
+    if not fit.success: raise RuntimeError(f"flow balance failed: {fit.message}")
+    calibration_dir=Path("/home/dell/a1/microc/result_2/compartment/chr18_cnv_jcn_balance")
+    if a.junction_window is not None:
+        counts=pd.read_csv(calibration_dir/"F1_chr18.junction_window_comparison.tsv",sep="\t")
+        counts=counts[counts.window_bp.eq(a.junction_window)].set_index("sv_id").loc[sv.sv_id]
+        sv_y=counts.junction_pairs.to_numpy(float); sv_eta=counts.background_mean.to_numpy(float)
+        beta_sv=float(counts.sampled_pairs_per_cn.iloc[0])
+        ref_counts=pd.read_csv(calibration_dir/"F1_chr18.reference_window_comparison.tsv",sep="\t")
+        ref_counts=ref_counts[ref_counts.window_bp.eq(a.junction_window)].set_index("boundary").loc[starts[1:]]
+        ref_y=ref_counts.total_reference_pairs.to_numpy(float)
+    else:
+        counts=pd.read_csv(a.outdir/"F1_chr18.refined_junction_pair_counts.tsv",sep="\t").set_index("sv_id").loc[sv.sv_id]
+        sv_y=counts.junction_contact_pairs_50kb.to_numpy(float); sv_eta=counts.distance_matched_background_mean.to_numpy(float)
+        depth_summary = pd.read_csv(
+            a.outdir/"F1_chr18.sampled_one_copy_junction_depth.summary.txt",
+            sep="\t", header=None, names=["metric", "value"]
+        ).set_index("metric").value
+        beta_sv=float(depth_summary.loc["one_copy_junction_pairs"])
+        ref_counts=pd.read_csv(a.outdir/"F1_chr18.reference_pair_counts.tsv",sep="\t").set_index("boundary").loc[starts[1:]]
+        ref_y=ref_counts.total_reference_pairs.to_numpy(float)
+    nominal_ref=np.minimum(seq_cn[:-1],seq_cn[1:])
+    beta_ref=float(np.median(ref_y/np.maximum(nominal_ref,.05)))
+    def objective(x):
+        residual=dense@x-target_vector
+        mu_sv=np.maximum(sv_eta+beta_sv*x[off_j:off_src],1e-9)
+        mu_ref=np.maximum(beta_ref*x[:off_j],1e-9)
+        value=.5*np.dot(residual,residual)+a.poisson_weight*(
+            np.sum(mu_sv-sv_y*np.log(mu_sv))+np.sum(mu_ref-ref_y*np.log(mu_ref)))
+        grad=dense.T@residual
+        grad[off_j:off_src]+=a.poisson_weight*beta_sv*(1-sv_y/mu_sv)
+        grad[:off_j]+=a.poisson_weight*beta_ref*(1-ref_y/mu_ref)
+        if a.junction_target_mode == "upper":
+            jcn = x[off_j:off_src]
+            targets = np.asarray(junction_targets)
+            active = (targets > 0) & (jcn > targets)
+            excess = jcn - targets
+            weights = a.junction_target_weight * np.maximum(
+                sv.eaglec2_probability.to_numpy(float), .05)
+            value += .5 * np.sum(weights[active] * excess[active] ** 2)
+            junction_grad = grad[off_j:off_src]
+            junction_grad[active] += weights[active] * excess[active]
+        return value,grad
+    bounds=[(0,None)]*(off_src+nv)
+    for i in range(nr):
+        bounds[off_ref+i] = (0, min(seq_cn[i], seq_cn[i+1]))
+    for j,(_,_,b1,b2,_,_) in enumerate(edge_vertices):bounds[off_j+j]=(0,min(seq_cn[b1],seq_cn[b2]))
+    joint=minimize(objective,fit.x,jac=True,method="L-BFGS-B",bounds=bounds,
+                   options={"maxiter":5000,"ftol":1e-12,"gtol":1e-8,"maxls":50})
+    if not joint.success: raise RuntimeError("joint Poisson balance failed: "+joint.message)
+    x=joint.x; reference_cn=x[:off_j]; junction_cn=x[off_j:off_src]; source_cn=x[off_src:]
+    flow_residual=design[:nv].dot(x)/fw-np.repeat(seq_cn,2)
+
+    segments["balanced_sequence_cn"]=segments.sequence_cn
+    segments.to_csv(a.outdir/"F1_chr18.balanced_sequence_cn.tsv",sep="\t",index=False)
+    pd.DataFrame({"edge_id":[f"REF{i+1:03d}" for i in range(nr)],"chrom":a.chrom,
+        "boundary":starts[1:],"reference_cn":reference_cn}).to_csv(
+        a.outdir/"F1_chr18.balanced_reference_cn.tsv",sep="\t",index=False)
+    out=[]
+    for j,row in sv.iterrows():
+        _,_,b1,b2,s1,s2=edge_vertices[j]; cap=min(seq_cn[b1],seq_cn[b2])
+        out.append({"sv_id":row.sv_id,"chrom1":row.chrom1,"pos1":int(row.pos1),"chrom2":row.chrom2,
+            "pos2":int(row.pos2),"orientation":row.orientation,"eaglec2_probability":row.eaglec2_probability,
+            "vertex1":f"{a.chrom}:{int(row.pos1)}:{s1}","vertex2":f"{a.chrom}:{int(row.pos2)}:{s2}",
+            "junction_cn":junction_cn[j],"endpoint_cn_capacity":cap,
+            "cnv_breakpoint_target_cn":junction_targets[j],
+            "junction_pairs":sv_y[j],"junction_window_bp":a.junction_window or 50000,"poisson_background_eta":sv_eta[j],
+            "sv_reads_per_cn":beta_sv,"poisson_expected_pairs":sv_eta[j]+beta_sv*junction_cn[j],
+            "junction_fraction_of_capacity":junction_cn[j]/cap if cap>0 else np.nan,
+            "cnv_identifiable":bool(junction_cn[j]>1e-3 and cap>0)})
+    junction=pd.DataFrame(out)
+    junction.to_csv(a.outdir/"F1_chr18.balanced_junction_cn.tsv",sep="\t",index=False)
+    pd.DataFrame({"segment_id":np.repeat(segments.segment_id,2),"chrom":a.chrom,
+        "side":np.tile(["L","R"],nseg),"source_cn":source_cn}).to_csv(
+        a.outdir/"F1_chr18.source_slack_cn.tsv",sep="\t",index=False)
+
+    side_connected = np.maximum(np.repeat(seq_cn, 2) - source_cn, 0)
+    side_qc = pd.DataFrame({
+        "segment_id": np.repeat(segments.segment_id, 2),
+        "chrom": a.chrom,
+        "side": np.tile(["L", "R"], nseg),
+        "sequence_cn": np.repeat(seq_cn, 2),
+        "connected_cn": side_connected,
+        "source_cn": source_cn,
+        "connected_fraction": np.divide(
+            side_connected, np.repeat(seq_cn, 2),
+            out=np.zeros(nv), where=np.repeat(seq_cn, 2) > 0),
+        "source_penalty": source_weights,
+        "is_sv_breakend": [v in breakend_vertices for v in range(nv)],
+        "is_telomere": [v in (0, nv - 1) for v in range(nv)],
+    })
+    side_qc.to_csv(a.outdir/"F1_chr18.connected_copy_fraction.tsv",
+                   sep="\t", index=False)
+    boundary_capacity = np.minimum(seq_cn[:-1], seq_cn[1:])
+    boundary_qc = pd.DataFrame({
+        "edge_id": [f"REF{i+1:03d}" for i in range(nr)],
+        "chrom": a.chrom,
+        "boundary": starts[1:],
+        "reference_cn": reference_cn,
+        "boundary_capacity_cn": boundary_capacity,
+        "reference_continuity_ratio": np.divide(
+            reference_cn, boundary_capacity, out=np.zeros(nr),
+            where=boundary_capacity > 0),
+        "is_sv_breakpoint": np.isin(starts[1:], endpoint_values),
+    })
+    boundary_qc.to_csv(a.outdir/"F1_chr18.reference_continuity_qc.tsv",
+                       sep="\t", index=False)
+
+    fig_qc, (qs, qr) = plt.subplots(2, 1, figsize=(15, 6), sharex=False)
+    ordinary_side = ~(side_qc.is_sv_breakend | side_qc.is_telomere)
+    qs.hist(side_qc.loc[ordinary_side, "connected_fraction"], bins=30,
+            range=(0, 1.05), color="#3182bd")
+    qs.axvline(1, color="black", ls="--", lw=1)
+    qs.set(xlabel="connected copy fraction", ylabel="ordinary segment sides",
+           title="Reference-default graph balance QC")
+    ordinary_boundary = ~boundary_qc.is_sv_breakpoint
+    qr.scatter(boundary_qc.loc[ordinary_boundary, "boundary"] / 1e6,
+               boundary_qc.loc[ordinary_boundary, "reference_continuity_ratio"],
+               s=18, color="#238b45", label="ordinary boundary")
+    qr.scatter(boundary_qc.loc[~ordinary_boundary, "boundary"] / 1e6,
+               boundary_qc.loc[~ordinary_boundary, "reference_continuity_ratio"],
+               s=24, color="#cb181d", label="SV breakpoint")
+    qr.axhline(1, color="black", ls="--", lw=1)
+    qr.set(xlabel="chr18 boundary (Mb)", ylabel="reference CN / boundary capacity")
+    qr.legend(frameon=False)
+    fig_qc.tight_layout()
+    fig_qc.savefig(a.outdir/"F1_chr18.graph_connectivity_qc.png", dpi=220)
+    plt.close(fig_qc)
+
+    fig,(ax,aj)=plt.subplots(2,1,figsize=(16,7),sharex=True,gridspec_kw={"height_ratios":[2.1,1]})
+    bins=pd.read_csv(a.cnr,sep="\t",comment="#")
+    bins=bins[bins.chromosome.astype(str).eq(a.chrom)].copy()
+    bins["copy_number"]=a.ploidy*np.exp2(pd.to_numeric(bins.log2,errors="coerce"))
+    centers=(bins.start.to_numpy(float)+bins.end.to_numpy(float))/(2e6)
+    normal_cn=bins.copy_number.replace([np.inf,-np.inf],np.nan).dropna().to_numpy(float)
+    ymax=max(3.0,float(np.nanquantile(normal_cn,.99))*1.15,float(parent.copy_number.max())*1.15)
+    visible=bins.copy_number.le(ymax)
+    ax.scatter(centers[visible],bins.loc[visible,"copy_number"],s=7,color="#9ecae1",alpha=.5,
+               linewidths=0,label="50-kb CNV bins (pre-CBS)",zorder=1)
+    # Extreme pre-CBS bins are omitted from this visualization; they remain in
+    # the CNR input and therefore are not silently removed from the analysis.
+    # One staircase represents contiguous [start, end) CBS intervals exactly;
+    # adjacent segments share a boundary but never overlap in genomic span.
+    edges=np.r_[parent.start.iloc[0],parent.end.to_numpy(float)]/1e6
+    stair_values = np.r_[parent.copy_number.to_numpy(float),
+                         parent.copy_number.iloc[-1]]
+    ax.step(edges, stair_values, where="post", color="#08519c", lw=2.2,
+            label="CBS segments [start, end)", zorder=3)
+    ax.set_ylim(-.1,ymax)
+    ax.legend(loc="upper right",frameon=False)
+    ax.set_ylabel("continuous copy number"); ax.set_title("F1 chr18: pre-CBS CNV bins, CBS segments, and CNV-balanced EagleC2 junction CN")
+    for row in junction.itertuples():
+        left,right,height=row.pos1/1e6,row.pos2/1e6,row.junction_cn
+        color="#b2182b" if row.cnv_identifiable else "0.65"
+        aj.plot([left,left,right,right],[0,height,height,0],color=color,lw=1.6)
+        aj.text((left+right)/2,height,row.sv_id,ha="center",va="bottom",fontsize=7)
+    aj.set(xlabel=f"{a.chrom} position (Mb)",ylabel="junction CN")
+    fig.tight_layout(); fig.savefig(a.outdir/"F1_chr18.cnv_jcn_balance.png",dpi=220); plt.close(fig)
+    with (a.outdir/"F1_chr18.balance_summary.txt").open("w") as f:
+        f.write("sequence_cn_source\tCNVkit CBS .cns\nsequence_cn_conversion\tCN=ploidy*2^log2\n")
+        f.write(f"nominal_ploidy\t{a.ploidy}\nsequence_cn_optimization\tfixed\nsv_read_likelihood\tPoisson\n")
+        f.write(f"chromosome\t{a.chrom}\nparent_cnv_segments\t{len(parent)}\ngraph_sequence_segments\t{nseg}\nsv_edges\t{nj}\n")
+        f.write(f"cnv_snap_tolerance_bp\t{a.cnv_snap_tolerance}\ncnv_snap_min_jump\t{a.cnv_snap_min_jump}\ncnv_snapped_boundaries\t{len(snap_rows)}\n")
+        f.write(f"flow_weight\t{a.flow_weight}\nsource_penalty\t{a.source_penalty}\n")
+        f.write(f"breakpoint_source_penalty\t{a.breakpoint_source_penalty}\n")
+        f.write(f"telomere_source_penalty\t{a.telomere_source_penalty}\n")
+        f.write(f"junction_penalty\t{a.junction_penalty}\n")
+        f.write(f"junction_target_weight\t{a.junction_target_weight}\njunction_target_mode\t{a.junction_target_mode}\njunction_target_rule\tmin(max_endpoint_CBS_CN_jump,endpoint_capacity)\n")
+        f.write(f"poisson_weight\t{a.poisson_weight}\njunction_window_bp\t{a.junction_window or 50000}\nsv_reads_per_cn\t{beta_sv}\nsv_reads_per_cn_source\tsampled_normal_chr18_matched_windows\nreference_reads_per_cn\t{beta_ref}\n")
+        f.write(f"solver_status\t{fit.message}\nmax_flow_residual_cn\t{np.max(np.abs(flow_residual)):.10g}\n")
+        f.write(f"total_junction_cn\t{junction_cn.sum():.10g}\ntotal_source_cn\t{source_cn.sum():.10g}\n")
+        f.write(f"ordinary_side_median_connected_fraction\t{side_qc.loc[ordinary_side, 'connected_fraction'].median():.10g}\n")
+        f.write(f"ordinary_boundary_median_reference_ratio\t{boundary_qc.loc[ordinary_boundary, 'reference_continuity_ratio'].median():.10g}\n")
+    print(a.outdir)
+
+if __name__ == "__main__": main()

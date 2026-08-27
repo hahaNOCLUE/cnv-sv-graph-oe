@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local chr18 evaluation of the generic oriented copy-flow expected model."""
 from pathlib import Path
+import argparse
 import sys
 
 import cooler
@@ -22,8 +23,7 @@ from cnv_latent_ssm.graph_expected import (  # noqa: E402
 from cnv_latent_ssm.features import compute_interaction_profile_correlation  # noqa: E402
 from cnv_latent_ssm.trans_external import fit_trans_external_from_cooler  # noqa: E402
 
-NEW = ROOT / "result_2/compartment/chr18_cnv_jcn_balance_source_sink"
-OUT = NEW / "copy_flow_additive_oe"
+DEFAULT_INPUT = ROOT / "result_2/compartment/chr18_cnv_jcn_balance_source_sink"
 RES = 50_000
 
 
@@ -49,18 +49,24 @@ def aggregate_500kb(observed, expected, valid, graph_distance,
 
 
 def main():
-    OUT.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--output-dir", type=Path)
+    args = parser.parse_args()
+    input_dir = args.input_dir.resolve()
+    output_dir = (args.output_dir or input_dir / "copy_flow_additive_oe").resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
     clr = cooler.Cooler(f"{ROOT}/result_2/F1/hic_results/mcool/F1.mcool::/resolutions/{RES}")
     bins = clr.bins().fetch("chr18").reset_index(drop=True)
     raw = np.asarray(clr.matrix(balance=False).fetch("chr18"), float)
     weights = pd.to_numeric(bins.weight, errors="coerce").to_numpy()
-    segments = pd.read_csv(NEW / "F1_chr18.balanced_sequence_cn.tsv", sep="\t")
+    segments = pd.read_csv(input_dir / "F1_chr18.balanced_sequence_cn.tsv", sep="\t")
     centers = (bins.start.to_numpy() + bins.end.to_numpy()) / 2
     cn = np.full(len(bins), np.nan)
     for row in segments.itertuples():
         cn[(centers >= row.start) & (centers < row.end)] = row.balanced_sequence_cn
     valid = np.isfinite(weights) & (weights > 0) & np.isfinite(cn) & (cn >= .1)
-    nodes = pd.read_csv(NEW / "F1_chr18.gGnome_peel_walk_nodes.tsv", sep="\t")
+    nodes = pd.read_csv(input_dir / "F1_chr18.gGnome_peel_walk_nodes.tsv", sep="\t")
     ploidy = 2.0
     baseline = valid & (np.abs(cn - ploidy) <= max(0.25 * ploidy, 0.25))
     baseline_decay = estimate_native_decay(
@@ -70,7 +76,7 @@ def main():
         cool_path, RES,
         str(ROOT / "result_2/compartment/CNVkit_F1_50kb/F1_50kb.cbs.cns"),
         ploidy=ploidy)
-    trans_diagnostics.to_csv(OUT / "chr18.trans_external_fit_by_chrom_pair.tsv",
+    trans_diagnostics.to_csv(output_dir / "chr18.trans_external_fit_by_chrom_pair.tsv",
                              sep="\t", index=False)
     preliminary_same_decay = subtract_baseline_collision(
         baseline_decay, trans_collision_floor, ploidy)
@@ -93,7 +99,7 @@ def main():
         collision_floor=intra_collision_floor, ploidy=ploidy)
     coarse, pearson, graph_distance_500kb = aggregate_500kb(
         raw, result.expected, valid, result.min_graph_distance_bins)
-    np.savez_compressed(OUT / "chr18.copy_flow_additive.npz", oe=oe,
+    np.savez_compressed(output_dir / "chr18.copy_flow_additive.npz", oe=oe,
                         expected=result.expected,
                         cis_expected=result.cis_expected,
                         external_expected=result.external_expected,
@@ -110,7 +116,7 @@ def main():
                         intra_collision_kappa=kappa,
                         cn=cn, valid=valid, ploidy=ploidy,
                         native_baseline_bins=baseline.sum())
-    nodes.to_csv(OUT / "chr18.peeled_walk_nodes.tsv", sep="\t", index=False)
+    nodes.to_csv(output_dir / "chr18.peeled_walk_nodes.tsv", sep="\t", index=False)
     extent=(0, bins.end.max()/1e6, bins.end.max()/1e6, 0)
     fig, axes = plt.subplots(2, 2, figsize=(14, 12), constrained_layout=True)
     logoe = np.log2(np.where(oe > 0, oe, np.nan))
@@ -134,7 +140,7 @@ def main():
     axes[1, 1].set_title("log2(cis expected / external expected)")
     for ax in axes.flat:
         ax.set_xlabel("chr18 position (Mb)"); ax.set_ylabel("chr18 position (Mb)")
-    fig.savefig(OUT / "chr18.copy_flow_additive.png", dpi=220)
+    fig.savefig(output_dir / "chr18.copy_flow_additive.png", dpi=220)
     distances, medians, means, eligible_counts, nonzero_counts = [], [], [], [], []
     for distance in range(1, len(raw)):
         observed = np.diag(raw, k=distance)
@@ -157,7 +163,7 @@ def main():
         "nonzero_pair_count": nonzero_counts,
         "nonzero_fraction": np.divide(nonzero_counts, eligible_counts),
     })
-    diagnostic.to_csv(OUT / "chr18.external_fit_contact_by_distance.tsv",
+    diagnostic.to_csv(output_dir / "chr18.external_fit_contact_by_distance.tsv",
                       sep="\t", index=False)
     fig2, ax = plt.subplots(figsize=(8, 5), constrained_layout=True)
     ax.plot(diagnostic.distance_bp / 1e6, diagnostic.mean_observed,
@@ -170,9 +176,9 @@ def main():
     ax2.plot(diagnostic.distance_bp / 1e6, diagnostic.nonzero_fraction,
              color="grey", alpha=.35, lw=1, label="nonzero fraction")
     ax2.set_ylabel("nonzero fraction")
-    fig2.savefig(OUT / "chr18.external_fit_contact_by_distance.png", dpi=220)
-    print(OUT / "chr18.copy_flow_additive.png")
-    print(OUT / "chr18.external_fit_contact_by_distance.png")
+    fig2.savefig(output_dir / "chr18.external_fit_contact_by_distance.png", dpi=220)
+    print(output_dir / "chr18.copy_flow_additive.png")
+    print(output_dir / "chr18.external_fit_contact_by_distance.png")
     print("ploidy", ploidy, "native_baseline_bins", int(baseline.sum()))
     print("trans_collision_floor", trans_collision_floor)
     print("intra_collision_floor", result.collision_floor, "kappa", kappa)
