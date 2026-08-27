@@ -18,6 +18,8 @@ def get_args():
     p.add_argument("--cnr", type=Path, default=root / "result_2/compartment/CNVkit_F1_50kb/F1_50kb.continuous.cnr",
                    help="Pre-CBS CNVkit bins to overlay on the CN panel")
     p.add_argument("--sv", type=Path, default=root / "result_2/EagleC2/F1/F1_chr18_50kb_EagleC2_SVs_raw.SV_calls.txt")
+    p.add_argument("--interchrom-sv", type=Path, default=root / "result_2/EagleC2/F1_genomewide_cis_trans_50kb/F1_genomewide_50kb_EagleC2_SVs_raw.SV_calls.txt",
+                   help="Genome-wide calls used to add explicit chr18-external edges")
     p.add_argument("--outdir", type=Path, default=root / "result_2/compartment/chr18_cnv_jcn_balance")
     p.add_argument("--chrom", default="chr18")
     p.add_argument("--ploidy", type=float, default=2.0,
@@ -25,9 +27,9 @@ def get_args():
     p.add_argument("--flow-weight", type=float, default=1e8,
                    help="Near-hard side-flow conservation weight")
     p.add_argument("--source-penalty", type=float, default=1000.0,
-                   help="Penalty for source flow at ordinary internal segment sides")
+                   help="L1 penalty for source flow at unresolved CN-step endpoints")
     p.add_argument("--breakpoint-source-penalty", type=float, default=10.0,
-                   help="Reduced source penalty at an EagleC2 breakend")
+                   help="Deprecated compatibility option; paired breakends now forbid source")
     p.add_argument("--telomere-source-penalty", type=float, default=0.0,
                    help="Source penalty at chromosome telomeres")
     p.add_argument("--junction-penalty", type=float, default=0.1)
@@ -66,6 +68,17 @@ def main():
     sv["orientation"] = probabilities.idxmax(axis=1)
     sv["eaglec2_probability"] = probabilities.max(axis=1)
     sv["sv_id"] = [f"SV{i+1:02d}" for i in range(len(sv))]
+    sv["is_external"] = False
+    n_intra = len(sv)
+    external = pd.read_csv(a.interchrom_sv, sep="\t")
+    external = external[(external.chrom1.eq(a.chrom)) ^
+                        (external.chrom2.eq(a.chrom))].copy().reset_index(drop=True)
+    external_probabilities = external.loc[:, ORIENTATIONS].astype(float)
+    external["orientation"] = external_probabilities.idxmax(axis=1)
+    external["eaglec2_probability"] = external_probabilities.max(axis=1)
+    external["sv_id"] = [f"EXT{i+1:02d}" for i in range(len(external))]
+    external["is_external"] = True
+    sv = pd.concat([sv, external], ignore_index=True, sort=False)
 
     # Snap a nearby CBS boundary to an SV endpoint only when pre-CBS bins show
     # a sustained local CN transition. This treats 50-kb calls at their actual
@@ -73,7 +86,9 @@ def main():
     raw_bins=pd.read_csv(a.cnr,sep="\t",comment="#")
     raw_bins=raw_bins[raw_bins.chromosome.astype(str).eq(a.chrom)].copy()
     raw_bins["copy_number"]=a.ploidy*np.exp2(pd.to_numeric(raw_bins.log2,errors="coerce"))
-    endpoint_values=sorted(set(sv.pos1.astype(int))|set(sv.pos2.astype(int)))
+    endpoint_values=sorted(
+        set(sv.loc[sv.chrom1.eq(a.chrom), "pos1"].astype(int)) |
+        set(sv.loc[sv.chrom2.eq(a.chrom), "pos2"].astype(int)))
     snap_rows=[]
     for i in range(1,len(parent)):
         boundary=int(parent.loc[i,"start"])
@@ -94,7 +109,8 @@ def main():
     pd.DataFrame(snap_rows).to_csv(a.outdir/"F1_chr18.cnv_sv_boundary_matches.tsv",sep="\t",index=False)
 
     cuts = set(parent.start.astype(int)) | set(parent.end.astype(int))
-    cuts |= set(sv.pos1.astype(int)) | set(sv.pos2.astype(int))
+    cuts |= set(sv.loc[sv.chrom1.eq(a.chrom), "pos1"].astype(int))
+    cuts |= set(sv.loc[sv.chrom2.eq(a.chrom), "pos2"].astype(int))
     records = []
     for i, row in parent.iterrows():
         local = sorted(c for c in cuts if int(row.start) <= c <= int(row.end))
@@ -121,19 +137,43 @@ def main():
         if not len(left) or not len(right): return 0.0
         return abs(seq_cn[int(left[-1])] - seq_cn[int(right[0])])
     for j, row in sv.iterrows():
-        v1,b1,s1 = endpoint_vertex(row.pos1,row.orientation[0],starts,ends)
-        v2,b2,s2 = endpoint_vertex(row.pos2,row.orientation[1],starts,ends)
-        incident[v1].append(off_j+j); incident[v2].append(off_j+j)
-        edge_vertices.append((v1,v2,b1,b2,s1,s2))
-        capacity = min(seq_cn[b1], seq_cn[b2])
-        junction_targets.append(min(max(cn_jump_at(row.pos1), cn_jump_at(row.pos2)), capacity))
+        if row.chrom1 == a.chrom:
+            v1,b1,s1 = endpoint_vertex(row.pos1,row.orientation[0],starts,ends)
+            chr_pos, external_chrom, external_pos = int(row.pos1), row.chrom2, int(row.pos2)
+        else:
+            v1,b1,s1 = endpoint_vertex(row.pos2,row.orientation[1],starts,ends)
+            chr_pos, external_chrom, external_pos = int(row.pos2), row.chrom1, int(row.pos1)
+        incident[v1].append(off_j+j)
+        if not row.is_external:
+            v2,b2,s2 = endpoint_vertex(row.pos2,row.orientation[1],starts,ends)
+            incident[v2].append(off_j+j)
+            capacity = min(seq_cn[b1], seq_cn[b2])
+            target = min(max(cn_jump_at(row.pos1), cn_jump_at(row.pos2)), capacity)
+        else:
+            v2,b2,s2 = -1,-1,"EXT"
+            capacity = seq_cn[b1]
+            target = min(cn_jump_at(chr_pos), capacity)
+        edge_vertices.append((v1,v2,b1,b2,s1,s2,external_chrom,external_pos))
+        junction_targets.append(target)
 
-    # Source/sink is a last-resort residual. Ordinary internal sides should
-    # continue through their reference edge; only called breakends and true
-    # chromosome ends receive reduced source penalties.
-    breakend_vertices = {vertex for edge in edge_vertices for vertex in edge[:2]}
-    source_weights = np.full(nv, a.source_penalty, dtype=float)
-    source_weights[list(breakend_vertices)] = a.breakpoint_source_penalty
+    # A paired intra-chromosomal breakend is an adjacency, not a molecule end.
+    # Source is hard-zero at ordinary and paired-breakend sides. It is allowed
+    # only at telomeres and at CN steps whose missing topology is unresolved.
+    breakend_vertices = {vertex for edge in edge_vertices for vertex in edge[:2]
+                         if vertex >= 0}
+    cn_step_vertices = set()
+    for i in range(nr):
+        if abs(seq_cn[i + 1] - seq_cn[i]) >= a.cnv_snap_min_jump:
+            cn_step_vertices.update((2 * i + 1, 2 * (i + 1)))
+    source_allowed = np.zeros(nv, dtype=bool)
+    # A CN step is the explicit evidence that the supplied adjacency set does
+    # not fully explain dosage. Permit a labelled latent endpoint there even
+    # when another paired SV touches the same side; all non-CN-step paired
+    # breakends remain hard-zero.
+    source_allowed[list(cn_step_vertices)] = True
+    source_allowed[[0, nv - 1]] = True
+    source_weights = np.zeros(nv, dtype=float)
+    source_weights[source_allowed] = a.source_penalty
     source_weights[[0, nv - 1]] = a.telomere_source_penalty
 
     rr=[]; cc=[]; vv=[]; rhs=[]
@@ -145,47 +185,62 @@ def main():
     for vertex in range(nv):
         coeffs=[(edge,fw) for edge in incident[vertex]]+[(off_src+vertex,fw)]
         add(coeffs,fw*seq_cn[vertex//2])
-    for vertex, penalty in enumerate(source_weights):
-        if penalty > 0:
-            add([(off_src+vertex,np.sqrt(penalty))],0)
     for j,p in enumerate(sv.eaglec2_probability):
         add([(off_j+j,np.sqrt(a.junction_penalty/max(float(p),.05)))],0)
-        if a.junction_target_mode == "equality":
+        if a.junction_target_mode == "equality" or bool(sv.iloc[j].is_external):
             tw = np.sqrt(a.junction_target_weight * max(float(p), .05))
             add([(off_j+j,tw)], tw*junction_targets[j])
     design=sparse.csr_matrix((vv,(rr,cc)),shape=(len(rhs),off_src+nv))
     dense=design.toarray(); target_vector=np.asarray(rhs)
-    fit=lsq_linear(dense,target_vector,bounds=(0,np.inf),method="bvls",tol=1e-12,max_iter=10000)
+    initial_upper = np.full(off_src + nv, np.inf)
+    initial_upper[off_src:][~source_allowed] = 1e-12
+    fit=lsq_linear(dense,target_vector,bounds=(np.zeros(off_src+nv),initial_upper),
+                   method="bvls",tol=1e-12,max_iter=10000)
     if not fit.success: raise RuntimeError(f"flow balance failed: {fit.message}")
     calibration_dir=Path("/home/dell/a1/microc/result_2/compartment/chr18_cnv_jcn_balance")
-    if a.junction_window is not None:
+    nominal_ref=np.minimum(seq_cn[:-1],seq_cn[1:])
+    if a.poisson_weight == 0:
+        sv_y = np.zeros(n_intra)
+        sv_eta = np.zeros(n_intra)
+        beta_sv = 1.0
+        ref_y = nominal_ref.copy()
+        beta_ref = 1.0
+    elif a.junction_window is not None:
         counts=pd.read_csv(calibration_dir/"F1_chr18.junction_window_comparison.tsv",sep="\t")
-        counts=counts[counts.window_bp.eq(a.junction_window)].set_index("sv_id").loc[sv.sv_id]
+        counts=counts[counts.window_bp.eq(a.junction_window)].set_index("sv_id").loc[sv.sv_id.iloc[:n_intra]]
         sv_y=counts.junction_pairs.to_numpy(float); sv_eta=counts.background_mean.to_numpy(float)
         beta_sv=float(counts.sampled_pairs_per_cn.iloc[0])
         ref_counts=pd.read_csv(calibration_dir/"F1_chr18.reference_window_comparison.tsv",sep="\t")
-        ref_counts=ref_counts[ref_counts.window_bp.eq(a.junction_window)].set_index("boundary").loc[starts[1:]]
-        ref_y=ref_counts.total_reference_pairs.to_numpy(float)
+        ref_series=(ref_counts[ref_counts.window_bp.eq(a.junction_window)]
+                    .set_index("boundary").total_reference_pairs.reindex(starts[1:]))
     else:
-        counts=pd.read_csv(a.outdir/"F1_chr18.refined_junction_pair_counts.tsv",sep="\t").set_index("sv_id").loc[sv.sv_id]
+        counts=pd.read_csv(a.outdir/"F1_chr18.refined_junction_pair_counts.tsv",sep="\t").set_index("sv_id").loc[sv.sv_id.iloc[:n_intra]]
         sv_y=counts.junction_contact_pairs_50kb.to_numpy(float); sv_eta=counts.distance_matched_background_mean.to_numpy(float)
         depth_summary = pd.read_csv(
             a.outdir/"F1_chr18.sampled_one_copy_junction_depth.summary.txt",
             sep="\t", header=None, names=["metric", "value"]
         ).set_index("metric").value
         beta_sv=float(depth_summary.loc["one_copy_junction_pairs"])
-        ref_counts=pd.read_csv(a.outdir/"F1_chr18.reference_pair_counts.tsv",sep="\t").set_index("boundary").loc[starts[1:]]
-        ref_y=ref_counts.total_reference_pairs.to_numpy(float)
-    nominal_ref=np.minimum(seq_cn[:-1],seq_cn[1:])
-    beta_ref=float(np.median(ref_y/np.maximum(nominal_ref,.05)))
+        ref_series=(pd.read_csv(a.outdir/"F1_chr18.reference_pair_counts.tsv",sep="\t")
+                    .set_index("boundary").total_reference_pairs.reindex(starts[1:]))
+    if a.poisson_weight != 0:
+        observed_ref = ref_series.notna().to_numpy()
+        beta_ref=float(np.median(ref_series.to_numpy(float)[observed_ref] /
+                                 np.maximum(nominal_ref[observed_ref],.05)))
+        ref_y=ref_series.fillna(pd.Series(beta_ref*nominal_ref,
+                                          index=starts[1:])).to_numpy(float)
     def objective(x):
         residual=dense@x-target_vector
-        mu_sv=np.maximum(sv_eta+beta_sv*x[off_j:off_src],1e-9)
+        mu_sv=np.maximum(sv_eta+beta_sv*x[off_j:off_j+n_intra],1e-9)
         mu_ref=np.maximum(beta_ref*x[:off_j],1e-9)
         value=.5*np.dot(residual,residual)+a.poisson_weight*(
             np.sum(mu_sv-sv_y*np.log(mu_sv))+np.sum(mu_ref-ref_y*np.log(mu_ref)))
         grad=dense.T@residual
-        grad[off_j:off_src]+=a.poisson_weight*beta_sv*(1-sv_y/mu_sv)
+        # Source is non-negative, so lambda*S is an exact L1 penalty. Unlike
+        # L2, it does not reward spreading one unresolved copy over many sites.
+        value += np.dot(source_weights, x[off_src:])
+        grad[off_src:] += source_weights
+        grad[off_j:off_j+n_intra]+=a.poisson_weight*beta_sv*(1-sv_y/mu_sv)
         grad[:off_j]+=a.poisson_weight*beta_ref*(1-ref_y/mu_ref)
         if a.junction_target_mode == "upper":
             jcn = x[off_j:off_src]
@@ -201,7 +256,12 @@ def main():
     bounds=[(0,None)]*(off_src+nv)
     for i in range(nr):
         bounds[off_ref+i] = (0, min(seq_cn[i], seq_cn[i+1]))
-    for j,(_,_,b1,b2,_,_) in enumerate(edge_vertices):bounds[off_j+j]=(0,min(seq_cn[b1],seq_cn[b2]))
+    for j,(_,_,b1,b2,_,_,_,_) in enumerate(edge_vertices):
+        capacity = seq_cn[b1] if b2 < 0 else min(seq_cn[b1],seq_cn[b2])
+        bounds[off_j+j]=(0,capacity)
+    for vertex in range(nv):
+        if not source_allowed[vertex]:
+            bounds[off_src + vertex] = (0, 0)
     joint=minimize(objective,fit.x,jac=True,method="L-BFGS-B",bounds=bounds,
                    options={"maxiter":5000,"ftol":1e-12,"gtol":1e-8,"maxls":50})
     if not joint.success: raise RuntimeError("joint Poisson balance failed: "+joint.message)
@@ -215,14 +275,20 @@ def main():
         a.outdir/"F1_chr18.balanced_reference_cn.tsv",sep="\t",index=False)
     out=[]
     for j,row in sv.iterrows():
-        _,_,b1,b2,s1,s2=edge_vertices[j]; cap=min(seq_cn[b1],seq_cn[b2])
+        _,_,b1,b2,s1,s2,external_chrom,external_pos=edge_vertices[j]
+        cap=seq_cn[b1] if b2 < 0 else min(seq_cn[b1],seq_cn[b2])
+        observed_pairs = sv_y[j] if j < n_intra else np.nan
+        background_eta = sv_eta[j] if j < n_intra else np.nan
         out.append({"sv_id":row.sv_id,"chrom1":row.chrom1,"pos1":int(row.pos1),"chrom2":row.chrom2,
             "pos2":int(row.pos2),"orientation":row.orientation,"eaglec2_probability":row.eaglec2_probability,
-            "vertex1":f"{a.chrom}:{int(row.pos1)}:{s1}","vertex2":f"{a.chrom}:{int(row.pos2)}:{s2}",
+            "is_external":bool(row.is_external),
+            "vertex1":f"{a.chrom}:{int(row.pos1 if row.chrom1 == a.chrom else row.pos2)}:{s1}",
+            "vertex2":f"{external_chrom}:{external_pos}:{s2}" if row.is_external else f"{a.chrom}:{int(row.pos2)}:{s2}",
             "junction_cn":junction_cn[j],"endpoint_cn_capacity":cap,
             "cnv_breakpoint_target_cn":junction_targets[j],
-            "junction_pairs":sv_y[j],"junction_window_bp":a.junction_window or 50000,"poisson_background_eta":sv_eta[j],
-            "sv_reads_per_cn":beta_sv,"poisson_expected_pairs":sv_eta[j]+beta_sv*junction_cn[j],
+            "junction_pairs":observed_pairs,"junction_window_bp":a.junction_window or 50000,"poisson_background_eta":background_eta,
+            "sv_reads_per_cn":beta_sv if j < n_intra else np.nan,
+            "poisson_expected_pairs":background_eta+beta_sv*junction_cn[j] if j < n_intra else np.nan,
             "junction_fraction_of_capacity":junction_cn[j]/cap if cap>0 else np.nan,
             "cnv_identifiable":bool(junction_cn[j]>1e-3 and cap>0)})
     junction=pd.DataFrame(out)
@@ -243,6 +309,8 @@ def main():
             side_connected, np.repeat(seq_cn, 2),
             out=np.zeros(nv), where=np.repeat(seq_cn, 2) > 0),
         "source_penalty": source_weights,
+        "source_allowed": source_allowed,
+        "is_unresolved_cn_step": [v in cn_step_vertices for v in range(nv)],
         "is_sv_breakend": [v in breakend_vertices for v in range(nv)],
         "is_telomere": [v in (0, nv - 1) for v in range(nv)],
     })
@@ -316,9 +384,10 @@ def main():
     with (a.outdir/"F1_chr18.balance_summary.txt").open("w") as f:
         f.write("sequence_cn_source\tCNVkit CBS .cns\nsequence_cn_conversion\tCN=ploidy*2^log2\n")
         f.write(f"nominal_ploidy\t{a.ploidy}\nsequence_cn_optimization\tfixed\nsv_read_likelihood\tPoisson\n")
-        f.write(f"chromosome\t{a.chrom}\nparent_cnv_segments\t{len(parent)}\ngraph_sequence_segments\t{nseg}\nsv_edges\t{nj}\n")
+        f.write(f"chromosome\t{a.chrom}\nparent_cnv_segments\t{len(parent)}\ngraph_sequence_segments\t{nseg}\nsv_edges\t{nj}\nintrachrom_sv_edges\t{n_intra}\ninterchrom_sv_edges\t{nj-n_intra}\n")
         f.write(f"cnv_snap_tolerance_bp\t{a.cnv_snap_tolerance}\ncnv_snap_min_jump\t{a.cnv_snap_min_jump}\ncnv_snapped_boundaries\t{len(snap_rows)}\n")
         f.write(f"flow_weight\t{a.flow_weight}\nsource_penalty\t{a.source_penalty}\n")
+        f.write("source_penalty_form\tL1\nordinary_internal_source\thard_zero\nnon_cn_step_paired_breakend_source\thard_zero\ncn_step_latent_endpoint\tallowed_L1\n")
         f.write(f"breakpoint_source_penalty\t{a.breakpoint_source_penalty}\n")
         f.write(f"telomere_source_penalty\t{a.telomere_source_penalty}\n")
         f.write(f"junction_penalty\t{a.junction_penalty}\n")

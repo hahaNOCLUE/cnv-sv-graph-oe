@@ -17,13 +17,12 @@ from cnv_latent_ssm.graph_expected import (  # noqa: E402
     compute_copy_flow_additive_oe,
     aggregate_observed_expected,
     estimate_native_decay,
-    fit_collision_floor,
-    subtract_baseline_collision,
+    fit_joint_same_decay,
 )
 from cnv_latent_ssm.features import compute_interaction_profile_correlation  # noqa: E402
 from cnv_latent_ssm.trans_external import fit_trans_external_from_cooler  # noqa: E402
 
-DEFAULT_INPUT = ROOT / "result_2/compartment/chr18_cnv_jcn_balance_source_sink"
+DEFAULT_INPUT = ROOT / "result_2/compartment/chr18_cnv_jcn_balance"
 RES = 50_000
 
 
@@ -39,26 +38,28 @@ def aggregate_500kb(observed, expected, valid, graph_distance,
     graph_pad[:len(valid), :len(valid)] = np.where(
         valid_grid, graph_distance, np.inf)
     graph_min = graph_pad.reshape(n, factor, n, factor).min(axis=(1, 3))
-    cutoff = min_compartment_distance_bp / RES
-    coarse_index = np.arange(n)
-    reference_distance = (np.abs(coarse_index[:, None] - coarse_index[None, :])
-                          * factor)
-    long_range = (reference_distance >= cutoff) & (graph_min >= cutoff)
     return coarse, compute_interaction_profile_correlation(
-        coarse, coarse_valid, log_transform=True, pair_mask=long_range), graph_min
+        coarse, coarse_valid, log_transform=True), graph_min
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--chrom", default="chr18")
+    parser.add_argument("--physical-ploidy", type=float, default=2.0,
+                        help="Molecule-copy normalization P")
+    parser.add_argument("--cnv-reference-ploidy", type=float, default=2.0,
+                        help="CNVkit log2-to-CN reference scale")
+    parser.add_argument("--min-walk-cn", type=float, default=0.0,
+                        help="Discard complete peeled walks below this CN")
     args = parser.parse_args()
     input_dir = args.input_dir.resolve()
     output_dir = (args.output_dir or input_dir / "copy_flow_additive_oe").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     clr = cooler.Cooler(f"{ROOT}/result_2/F1/hic_results/mcool/F1.mcool::/resolutions/{RES}")
-    bins = clr.bins().fetch("chr18").reset_index(drop=True)
-    raw = np.asarray(clr.matrix(balance=False).fetch("chr18"), float)
+    bins = clr.bins().fetch(args.chrom).reset_index(drop=True)
+    raw = np.asarray(clr.matrix(balance=False).fetch(args.chrom), float)
     weights = pd.to_numeric(bins.weight, errors="coerce").to_numpy()
     segments = pd.read_csv(input_dir / "F1_chr18.balanced_sequence_cn.tsv", sep="\t")
     centers = (bins.start.to_numpy() + bins.end.to_numpy()) / 2
@@ -67,7 +68,10 @@ def main():
         cn[(centers >= row.start) & (centers < row.end)] = row.balanced_sequence_cn
     valid = np.isfinite(weights) & (weights > 0) & np.isfinite(cn) & (cn >= .1)
     nodes = pd.read_csv(input_dir / "F1_chr18.gGnome_peel_walk_nodes.tsv", sep="\t")
-    ploidy = 2.0
+    nodes = nodes[nodes.walk_cn >= args.min_walk_cn].copy()
+    if nodes.empty:
+        raise ValueError("no peeled walks remain after --min-walk-cn filtering")
+    ploidy = args.physical_ploidy
     baseline = valid & (np.abs(cn - ploidy) <= max(0.25 * ploidy, 0.25))
     baseline_decay = estimate_native_decay(
         raw, valid, background_mask=np.outer(baseline, baseline))
@@ -75,25 +79,13 @@ def main():
     trans_collision_floor, trans_diagnostics = fit_trans_external_from_cooler(
         cool_path, RES,
         str(ROOT / "result_2/compartment/CNVkit_F1_50kb/F1_50kb.cbs.cns"),
-        ploidy=ploidy)
+        ploidy=args.cnv_reference_ploidy)
     trans_diagnostics.to_csv(output_dir / "chr18.trans_external_fit_by_chrom_pair.tsv",
                              sep="\t", index=False)
-    preliminary_same_decay = subtract_baseline_collision(
-        baseline_decay, trans_collision_floor, ploidy)
-    _, preliminary = compute_copy_flow_additive_oe(
-        raw, bins, valid, cn, nodes, preliminary_same_decay, RES,
-        collision_floor=trans_collision_floor,
-        external_fit_mask=None, ploidy=ploidy)
-    index = np.arange(len(valid))
-    long_range_unconnected = (
-        (preliminary.cis_copy_pairs <= 0)
-        & (np.abs(index[:, None] - index[None, :]) >= 200)
-    )
-    intra_collision_floor = fit_collision_floor(
-        raw, preliminary.external_copy_pairs, valid, long_range_unconnected)
+    same_decay, intra_collision_floor = fit_joint_same_decay(
+        raw, valid, np.outer(baseline, baseline), trans_collision_floor,
+        ploidy=ploidy)
     kappa = intra_collision_floor / trans_collision_floor
-    same_decay = subtract_baseline_collision(
-        baseline_decay, intra_collision_floor, ploidy)
     oe, result = compute_copy_flow_additive_oe(
         raw, bins, valid, cn, nodes, same_decay, RES,
         collision_floor=intra_collision_floor, ploidy=ploidy)
@@ -114,6 +106,7 @@ def main():
                         min_graph_distance_500kb_bins=graph_distance_500kb,
                         trans_collision_floor=trans_collision_floor,
                         intra_collision_kappa=kappa,
+                        min_walk_cn=args.min_walk_cn,
                         cn=cn, valid=valid, ploidy=ploidy,
                         native_baseline_bins=baseline.sum())
     nodes.to_csv(output_dir / "chr18.peeled_walk_nodes.tsv", sep="\t", index=False)
@@ -139,7 +132,7 @@ def main():
                       interpolation="none")
     axes[1, 1].set_title("log2(cis expected / external expected)")
     for ax in axes.flat:
-        ax.set_xlabel("chr18 position (Mb)"); ax.set_ylabel("chr18 position (Mb)")
+        ax.set_xlabel(f"{args.chrom} position (Mb)"); ax.set_ylabel(f"{args.chrom} position (Mb)")
     fig.savefig(output_dir / "chr18.copy_flow_additive.png", dpi=220)
     distances, medians, means, eligible_counts, nonzero_counts = [], [], [], [], []
     for distance in range(1, len(raw)):

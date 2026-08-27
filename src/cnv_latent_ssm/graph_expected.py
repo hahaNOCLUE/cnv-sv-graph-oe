@@ -11,6 +11,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize
 
 
 @dataclass
@@ -88,6 +89,74 @@ def subtract_baseline_collision(baseline_decay: np.ndarray,
                       - collision_floor * baseline_external_pairs, 0)
 
 
+def fit_joint_same_decay(matrix: np.ndarray, valid_mask: np.ndarray,
+                         background_mask: Optional[np.ndarray],
+                         trans_collision_floor: float, ploidy: float = 2.0,
+                         n_knots: int = 20, prior_log_sd: float = 0.7):
+    """Jointly fit positive monotone P_same(d) and an intra collision floor.
+
+    The likelihood uses all eligible diagonal pixels, including zero counts.
+    A low-dimensional piecewise-linear curve in log-distance/log-rate space
+    prevents the collision floor from being identified by clipping a flexible
+    distance curve. ``B_trans`` supplies only a weak log-normal anchor.
+    """
+    if ploidy < 1 or trans_collision_floor <= 0:
+        raise ValueError("joint decay fit requires ploidy >= 1 and B_trans > 0")
+    n = matrix.shape[0]
+    eligible_grid = np.outer(valid_mask, valid_mask)
+    if background_mask is not None:
+        eligible_grid &= np.asarray(background_mask, dtype=bool)
+    distances, totals, counts = [], [], []
+    for distance in range(1, n):
+        values = np.diag(matrix, k=distance)
+        keep = np.diag(eligible_grid, k=distance)
+        use = keep & np.isfinite(values) & (values >= 0)
+        if use.any():
+            distances.append(distance)
+            totals.append(float(values[use].sum()))
+            counts.append(int(use.sum()))
+    distances = np.asarray(distances, float)
+    totals = np.asarray(totals, float)
+    counts = np.asarray(counts, float)
+    if len(distances) < 2:
+        raise ValueError("insufficient baseline distances for joint decay fit")
+    knot_x = np.linspace(np.log(distances.min()), np.log(distances.max()),
+                         min(n_knots, len(distances)))
+    log_distance = np.log(distances)
+    rate = totals / counts
+    floor_fraction = 1.0 - 1.0 / ploidy
+    initial_b = trans_collision_floor
+    initial_rate = np.maximum(rate - initial_b * floor_fraction, 1e-6)
+    initial_log_p = np.interp(knot_x, log_distance, np.log(initial_rate))
+    initial_log_p = _weighted_nonincreasing_isotonic(
+        initial_log_p, np.ones_like(initial_log_p))
+    x0 = np.r_[initial_log_p, np.log(initial_b)]
+
+    def objective(parameters):
+        log_p = np.interp(log_distance, knot_x, parameters[:-1])
+        b_intra = np.exp(parameters[-1])
+        mu = np.exp(log_p) + floor_fraction * b_intra
+        nll = np.sum(counts * mu - totals * np.log(np.maximum(mu, 1e-12)))
+        prior = .5 * ((parameters[-1] - np.log(trans_collision_floor)) /
+                      prior_log_sd) ** 2
+        return nll + prior
+
+    constraints = [
+        {"type": "ineq", "fun": lambda x, i=i: x[i] - x[i + 1]}
+        for i in range(len(knot_x) - 1)
+    ]
+    fit = minimize(objective, x0, method="SLSQP", constraints=constraints,
+                   bounds=[(-30, 30)] * len(knot_x) + [(-30, 10)],
+                   options={"maxiter": 3000, "ftol": 1e-9})
+    if not fit.success:
+        raise RuntimeError(f"joint same-decay fit failed: {fit.message}")
+    all_distance = np.arange(n, dtype=float)
+    all_log_distance = np.log(np.maximum(all_distance, 1))
+    same_decay = np.exp(np.interp(all_log_distance, knot_x, fit.x[:-1]))
+    same_decay[0] = same_decay[1]
+    return same_decay, float(np.exp(fit.x[-1]))
+
+
 def aggregate_observed_expected(observed: np.ndarray, expected: np.ndarray,
                                 valid_mask: np.ndarray, factor: int):
     """Coarsen counts and expected separately, then return sum(O)/sum(E)."""
@@ -117,10 +186,15 @@ def aggregate_observed_expected(observed: np.ndarray, expected: np.ndarray,
 
 def _walk_bin_coordinates(bins: pd.DataFrame, walk: pd.DataFrame):
     centers = (bins["start"].to_numpy(float) + bins["end"].to_numpy(float)) / 2
+    bin_chrom = (bins["chrom"].astype(str).to_numpy()
+                 if "chrom" in bins else None)
     ids, positions = [], []
     offset = 0.0
     for node in walk.sort_values("order").itertuples():
-        hit = np.flatnonzero((centers >= node.start) & (centers < node.end))
+        in_node = (centers >= node.start) & (centers < node.end)
+        if bin_chrom is not None and hasattr(node, "chrom"):
+            in_node &= bin_chrom == str(node.chrom)
+        hit = np.flatnonzero(in_node)
         if str(node.strand) == "+":
             position = offset + centers[hit] - float(node.start)
         elif str(node.strand) == "-":
