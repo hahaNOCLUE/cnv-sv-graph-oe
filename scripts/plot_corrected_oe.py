@@ -13,6 +13,7 @@ import numpy as np
 ROOT = Path("/home/dell/a1/microc")
 sys.path.insert(0, str(ROOT / "code/cnv_latent_ssm/src"))
 from cnv_latent_ssm.graph_expected import aggregate_observed_expected  # noqa: E402
+from cnv_latent_ssm.features import compute_interaction_profile_correlation  # noqa: E402
 
 
 def main():
@@ -33,19 +34,30 @@ def main():
     _, _, oe, coarse_valid = aggregate_observed_expected(
         observed, expected, valid, args.factor)
     eligible = np.outer(coarse_valid, coarse_valid)
+    pearson = compute_interaction_profile_correlation(
+        oe, coarse_valid, log_transform=True)
     shown = np.full_like(oe, np.nan)
     shown[eligible] = np.log2(np.maximum(oe[eligible], 2 ** -2))
 
     chrom_end = bins.end.max() / 1e6
     resolution_kb = int(clr.binsize * args.factor / 1000)
-    fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
-    image = ax.imshow(shown, cmap="RdBu_r", vmin=-2, vmax=2,
-                      extent=(0, chrom_end, chrom_end, 0),
-                      interpolation="none")
-    ax.set(title=f"CN/SV copy-flow corrected O/E ({resolution_kb} kb)",
-           xlabel=f"{args.chrom} position (Mb)",
-           ylabel=f"{args.chrom} position (Mb)")
-    fig.colorbar(image, ax=ax, label="log2[sum(O)/sum(E)], zeros shown at -2")
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7), constrained_layout=True)
+    image = axes[0].imshow(shown, cmap="RdBu_r", vmin=-2, vmax=2,
+                           extent=(0, chrom_end, chrom_end, 0),
+                           interpolation="none")
+    axes[0].set(title=f"Corrected O/E ({resolution_kb} kb)",
+                xlabel=f"{args.chrom} position (Mb)",
+                ylabel=f"{args.chrom} position (Mb)")
+    correlation = axes[1].imshow(
+        pearson, cmap="RdBu_r", vmin=-1, vmax=1,
+        extent=(0, chrom_end, chrom_end, 0), interpolation="none")
+    axes[1].set(title=f"Standard Pearson ({resolution_kb} kb, unmasked)",
+                xlabel=f"{args.chrom} position (Mb)",
+                ylabel=f"{args.chrom} position (Mb)")
+    fig.colorbar(image, ax=axes[0], shrink=.82,
+                 label="log2[sum(O)/sum(E)], zeros shown at -2")
+    fig.colorbar(correlation, ax=axes[1], shrink=.82,
+                 label="Pearson correlation")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=220)
 

@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 from scipy import stats
 from cnv_latent_ssm.ssm import CNVAwareSSM
+from cnv_latent_ssm.cn_response import fit_monotonic_cn_response
 from cnv_latent_ssm.graph_expected import (
     aggregate_observed_expected,
     accumulate_oriented_walks,
@@ -26,6 +27,20 @@ def test_native_decay_uses_weighted_isotonic_not_running_minimum():
     assert np.all(np.diff(curve) <= 1e-12)
     assert curve[2] > 1.0
     assert curve[-1] > 1.0
+
+
+def test_monotonic_cn_response_recovers_increasing_effect():
+    cn = np.repeat(np.array([0.5, 1.0, 2.0]), 40)
+    i, j = np.meshgrid(cn, cn, indexing="ij")
+    exposure = np.ones_like(i)
+    observed = exposure * np.sqrt(i * j)
+    fit = fit_monotonic_cn_response(
+        observed.ravel(), exposure.ravel(), i.ravel(), j.ravel(),
+        ridge=0.001, smooth=0.001, max_pixels=observed.size)
+    response = fit.evaluate(np.array([0.5, 1.0, 2.0]))
+    assert fit.direction == "increasing"
+    assert response[0] <= response[1] <= response[2]
+    np.testing.assert_allclose(response[1], 1.0, atol=1e-6)
 from cnv_latent_ssm.caller import (
     build_contact_knn_graph,
     identify_transition_breakpoints,
