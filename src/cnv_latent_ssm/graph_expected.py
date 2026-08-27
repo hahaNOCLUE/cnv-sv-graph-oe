@@ -23,6 +23,7 @@ class GraphExpectedResult:
     total_copy_pairs: np.ndarray
     collision_floor: float
     capture_visibility: np.ndarray
+    min_graph_distance_bins: np.ndarray
 
 
 def _weighted_nonincreasing_isotonic(values: np.ndarray,
@@ -48,7 +49,7 @@ def _weighted_nonincreasing_isotonic(values: np.ndarray,
 
 def estimate_native_decay(matrix: np.ndarray, valid_mask: np.ndarray,
                           background_mask: Optional[np.ndarray] = None) -> np.ndarray:
-    """Estimate native P(d) using weighted isotonic regression on log counts."""
+    """Estimate zero-inclusive baseline total contact rate by distance."""
     n = matrix.shape[0]
     valid = np.outer(valid_mask, valid_mask)
     if background_mask is not None:
@@ -58,18 +59,60 @@ def estimate_native_decay(matrix: np.ndarray, valid_mask: np.ndarray,
     for distance in range(n):
         values = np.diag(matrix, k=distance)
         keep = np.diag(valid, k=distance)
-        positive = keep & np.isfinite(values) & (values > 0)
-        if positive.any():
-            curve[distance] = np.median(values[positive])
-            counts[distance] = positive.sum()
-    supported = np.flatnonzero(np.isfinite(curve) & (curve > 0))
+        eligible = keep & np.isfinite(values) & (values >= 0)
+        if eligible.any():
+            curve[distance] = np.mean(values[eligible])
+            counts[distance] = eligible.sum()
+    supported = np.flatnonzero(np.isfinite(curve) & (curve >= 0))
     if not len(supported):
         raise ValueError("no supported native-distance background pixels")
+    positive_rate = curve[supported][curve[supported] > 0]
+    epsilon = (max(float(positive_rate.min()) * 0.01, 1e-12)
+               if len(positive_rate) else 1e-12)
     fitted_log = _weighted_nonincreasing_isotonic(
-        np.log(curve[supported]), counts[supported])
+        np.log(curve[supported] + epsilon), counts[supported])
     # Interpolation occurs after fitting, so an isolated low diagonal cannot
     # permanently drag every more-distal expected value downward.
-    return np.exp(np.interp(np.arange(n), supported, fitted_log))
+    return np.maximum(
+        np.exp(np.interp(np.arange(n), supported, fitted_log)) - epsilon, 0)
+
+
+def subtract_baseline_collision(baseline_decay: np.ndarray,
+                                collision_floor: float,
+                                ploidy: float = 2.0) -> np.ndarray:
+    """Recover same-molecule P(d) from baseline total contact decay."""
+    if ploidy <= 0:
+        raise ValueError("ploidy must be positive")
+    baseline_external_pairs = 1.0 - 1.0 / ploidy
+    return np.maximum(np.asarray(baseline_decay, float)
+                      - collision_floor * baseline_external_pairs, 0)
+
+
+def aggregate_observed_expected(observed: np.ndarray, expected: np.ndarray,
+                                valid_mask: np.ndarray, factor: int):
+    """Coarsen counts and expected separately, then return sum(O)/sum(E)."""
+    if factor < 1:
+        raise ValueError("factor must be positive")
+    n = len(valid_mask)
+    coarse_n = int(np.ceil(n / factor))
+    size = coarse_n * factor
+    valid = np.outer(valid_mask, valid_mask)
+    observed_pad = np.zeros((size, size), dtype=float)
+    expected_pad = np.zeros((size, size), dtype=float)
+    observed_pad[:n, :n] = np.where(valid, observed, 0)
+    expected_pad[:n, :n] = np.where(valid, expected, 0)
+    axes = (1, 3)
+    observed_sum = observed_pad.reshape(
+        coarse_n, factor, coarse_n, factor).sum(axis=axes)
+    expected_sum = expected_pad.reshape(
+        coarse_n, factor, coarse_n, factor).sum(axis=axes)
+    oe = np.divide(observed_sum, expected_sum, out=np.zeros_like(observed_sum),
+                   where=expected_sum > 0)
+    coarse_valid = np.array([
+        valid_mask[i * factor:min((i + 1) * factor, n)].any()
+        for i in range(coarse_n)
+    ])
+    return observed_sum, expected_sum, oe, coarse_valid
 
 
 def _walk_bin_coordinates(bins: pd.DataFrame, walk: pd.DataFrame):
@@ -109,6 +152,7 @@ def accumulate_oriented_walks(bins: pd.DataFrame, walk_nodes: pd.DataFrame,
     n = len(bins)
     cis_expected = np.zeros((n, n), dtype=float)
     cis_pairs = np.zeros((n, n), dtype=float)
+    min_distance = np.full((n, n), np.inf, dtype=float)
     for _, walk in walk_nodes.groupby("walk_id", sort=False):
         ids, position, length = _walk_bin_coordinates(bins, walk)
         if not len(ids):
@@ -130,7 +174,8 @@ def accumulate_oriented_walks(bins: pd.DataFrame, walk_nodes: pd.DataFrame,
         np.add.at(cis_expected, (rows, cols),
                   (copy * native_decay[distance_bins]).ravel())
         np.add.at(cis_pairs, (rows, cols), copy)
-    return cis_expected, cis_pairs
+        np.minimum.at(min_distance, (rows, cols), distance_bins.ravel())
+    return cis_expected, cis_pairs, min_distance
 
 
 def fit_collision_floor(matrix: np.ndarray, intermolecular_pairs: np.ndarray,
@@ -166,7 +211,7 @@ def compute_copy_flow_additive_oe(
     (for example mappability/MNase/GC recovery), never a free long-range bin
     effect learned from the contact matrix.
     """
-    cis_expected, raw_cis_pairs = accumulate_oriented_walks(
+    cis_expected, raw_cis_pairs, min_graph_distance = accumulate_oriented_walks(
         bins, walk_nodes, native_decay, resolution, ploidy)
     dosage = np.maximum(np.asarray(segment_cn, float) / ploidy, 0)
     total_pairs = np.outer(dosage, dosage)
@@ -206,7 +251,8 @@ def compute_copy_flow_additive_oe(
     oe[usable] = matrix[usable] / expected[usable]
     return oe, GraphExpectedResult(
         expected, cis_expected, external_expected, cis_pairs,
-        external_pairs, total_pairs, float(collision_floor), visibility)
+        external_pairs, total_pairs, float(collision_floor), visibility,
+        min_graph_distance)
 
 
 def flow_residuals(segment_cn: np.ndarray, incident_junction_cn: np.ndarray,

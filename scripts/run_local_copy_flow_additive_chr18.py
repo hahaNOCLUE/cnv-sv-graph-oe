@@ -14,7 +14,10 @@ ROOT = Path("/home/dell/a1/microc")
 sys.path.insert(0, str(ROOT / "code/cnv_latent_ssm/src"))
 from cnv_latent_ssm.graph_expected import (  # noqa: E402
     compute_copy_flow_additive_oe,
+    aggregate_observed_expected,
     estimate_native_decay,
+    fit_collision_floor,
+    subtract_baseline_collision,
 )
 from cnv_latent_ssm.features import compute_interaction_profile_correlation  # noqa: E402
 from cnv_latent_ssm.trans_external import fit_trans_external_from_cooler  # noqa: E402
@@ -24,18 +27,25 @@ OUT = NEW / "copy_flow_additive_oe"
 RES = 50_000
 
 
-def aggregate_500kb(oe, valid):
+def aggregate_500kb(observed, expected, valid, graph_distance,
+                    min_compartment_distance_bp=2_000_000):
     factor = 10
     n = int(np.ceil(len(valid) / factor))
     size = n * factor
-    padded = np.full((size, size), np.nan)
-    padded[:len(valid), :len(valid)] = np.where(np.outer(valid, valid), oe, np.nan)
-    with np.errstate(invalid="ignore"):
-        coarse = np.nanmean(padded.reshape(n, factor, n, factor), axis=(1, 3))
-    coarse_valid = np.array([valid[i * factor:min((i + 1) * factor, len(valid))].any()
-                             for i in range(n)])
+    valid_grid = np.outer(valid, valid)
+    _, _, coarse, coarse_valid = aggregate_observed_expected(
+        observed, expected, valid, factor)
+    graph_pad = np.full((size, size), np.inf)
+    graph_pad[:len(valid), :len(valid)] = np.where(
+        valid_grid, graph_distance, np.inf)
+    graph_min = graph_pad.reshape(n, factor, n, factor).min(axis=(1, 3))
+    cutoff = min_compartment_distance_bp / RES
+    coarse_index = np.arange(n)
+    reference_distance = (np.abs(coarse_index[:, None] - coarse_index[None, :])
+                          * factor)
+    long_range = (reference_distance >= cutoff) & (graph_min >= cutoff)
     return coarse, compute_interaction_profile_correlation(
-        np.nan_to_num(coarse), coarse_valid, log_transform=True)
+        coarse, coarse_valid, log_transform=True, pair_mask=long_range), graph_min
 
 
 def main():
@@ -53,20 +63,36 @@ def main():
     nodes = pd.read_csv(NEW / "F1_chr18.gGnome_peel_walk_nodes.tsv", sep="\t")
     ploidy = 2.0
     baseline = valid & (np.abs(cn - ploidy) <= max(0.25 * ploidy, 0.25))
-    native_decay = estimate_native_decay(
+    baseline_decay = estimate_native_decay(
         raw, valid, background_mask=np.outer(baseline, baseline))
     cool_path = str(ROOT / "result_2/F1/hic_results/mcool/F1.mcool")
-    collision_floor, trans_diagnostics = fit_trans_external_from_cooler(
+    trans_collision_floor, trans_diagnostics = fit_trans_external_from_cooler(
         cool_path, RES,
         str(ROOT / "result_2/compartment/CNVkit_F1_50kb/F1_50kb.cbs.cns"),
         ploidy=ploidy)
     trans_diagnostics.to_csv(OUT / "chr18.trans_external_fit_by_chrom_pair.tsv",
                              sep="\t", index=False)
-    oe, result = compute_copy_flow_additive_oe(
-        raw, bins, valid, cn, nodes, native_decay, RES,
-        collision_floor=collision_floor,
+    preliminary_same_decay = subtract_baseline_collision(
+        baseline_decay, trans_collision_floor, ploidy)
+    _, preliminary = compute_copy_flow_additive_oe(
+        raw, bins, valid, cn, nodes, preliminary_same_decay, RES,
+        collision_floor=trans_collision_floor,
         external_fit_mask=None, ploidy=ploidy)
-    coarse, pearson = aggregate_500kb(oe, valid)
+    index = np.arange(len(valid))
+    long_range_unconnected = (
+        (preliminary.cis_copy_pairs <= 0)
+        & (np.abs(index[:, None] - index[None, :]) >= 200)
+    )
+    intra_collision_floor = fit_collision_floor(
+        raw, preliminary.external_copy_pairs, valid, long_range_unconnected)
+    kappa = intra_collision_floor / trans_collision_floor
+    same_decay = subtract_baseline_collision(
+        baseline_decay, intra_collision_floor, ploidy)
+    oe, result = compute_copy_flow_additive_oe(
+        raw, bins, valid, cn, nodes, same_decay, RES,
+        collision_floor=intra_collision_floor, ploidy=ploidy)
+    coarse, pearson, graph_distance_500kb = aggregate_500kb(
+        raw, result.expected, valid, result.min_graph_distance_bins)
     np.savez_compressed(OUT / "chr18.copy_flow_additive.npz", oe=oe,
                         expected=result.expected,
                         cis_expected=result.cis_expected,
@@ -75,7 +101,13 @@ def main():
                         external_copy_pairs=result.external_copy_pairs,
                         total_copy_pairs=result.total_copy_pairs,
                         collision_floor=result.collision_floor,
-                        pearson_500kb=pearson, native_decay=native_decay,
+                        oe_500kb=coarse, pearson_500kb=pearson,
+                        baseline_decay=baseline_decay,
+                        same_molecule_decay=same_decay,
+                        min_graph_distance_bins=result.min_graph_distance_bins,
+                        min_graph_distance_500kb_bins=graph_distance_500kb,
+                        trans_collision_floor=trans_collision_floor,
+                        intra_collision_kappa=kappa,
                         cn=cn, valid=valid, ploidy=ploidy,
                         native_baseline_bins=baseline.sum())
     nodes.to_csv(OUT / "chr18.peeled_walk_nodes.tsv", sep="\t", index=False)
@@ -142,7 +174,8 @@ def main():
     print(OUT / "chr18.copy_flow_additive.png")
     print(OUT / "chr18.external_fit_contact_by_distance.png")
     print("ploidy", ploidy, "native_baseline_bins", int(baseline.sum()))
-    print("collision_floor", result.collision_floor)
+    print("trans_collision_floor", trans_collision_floor)
+    print("intra_collision_floor", result.collision_floor, "kappa", kappa)
 
 
 if __name__ == "__main__":

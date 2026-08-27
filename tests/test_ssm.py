@@ -6,10 +6,12 @@ import pytest
 from scipy import stats
 from cnv_latent_ssm.ssm import CNVAwareSSM
 from cnv_latent_ssm.graph_expected import (
+    aggregate_observed_expected,
     accumulate_oriented_walks,
     compute_copy_flow_additive_oe,
     estimate_native_decay,
     flow_residuals,
+    subtract_baseline_collision,
 )
 
 
@@ -355,10 +357,11 @@ def test_oriented_deletion_walk_uses_direct_graph_adjacency():
         "strand": ["+", "+"],
     })
     decay = np.array([100., 50., 25., 12.5, 6.25, 3.125])
-    expected, copies = accumulate_oriented_walks(
+    expected, copies, distance = accumulate_oriented_walks(
         bins, walks, decay, resolution=50_000, ploidy=2.)
     np.testing.assert_allclose(copies[1, 4], .5)
     np.testing.assert_allclose(expected[1, 4], .5 * decay[1])
+    np.testing.assert_allclose(distance[1, 4], 1)
 
 
 def test_copy_flow_expected_sums_multiple_paths_instead_of_shortest_only():
@@ -373,11 +376,31 @@ def test_copy_flow_expected_sums_multiple_paths_instead_of_shortest_only():
         "strand": ["+"] * 5,
     })
     decay = np.array([100., 40., 10.])
-    expected, copies = accumulate_oriented_walks(
+    expected, copies, distance = accumulate_oriented_walks(
         bins, walks, decay, resolution=50_000, ploidy=2.)
     # One half-copy path has d=1 and another half-copy path has d=2.
     np.testing.assert_allclose(expected[0, 2], .5 * 40. + .5 * 10.)
     np.testing.assert_allclose(copies[0, 2], 1.)
+    np.testing.assert_allclose(distance[0, 2], 1.)
+
+
+def test_native_decay_includes_zero_contact_pixels():
+    matrix = np.array([
+        [4., 2., 0., 0.],
+        [2., 4., 0., 0.],
+        [0., 0., 4., 2.],
+        [0., 0., 2., 4.],
+    ])
+    curve = estimate_native_decay(matrix, np.ones(4, dtype=bool))
+    # Distance one has [2, 0, 2], hence its unsmoothed rate is 4/3 rather
+    # than the positive-only conditional mean of 2.
+    assert curve[1] < 2.0
+
+
+def test_baseline_collision_is_subtracted_before_walk_decay():
+    baseline = np.array([10., 5., 2.])
+    same = subtract_baseline_collision(baseline, collision_floor=2., ploidy=2.)
+    np.testing.assert_allclose(same, [9., 4., 1.])
 
 
 def test_additive_expected_partitions_total_copy_pair_pool():
@@ -432,6 +455,39 @@ def test_capture_visibility_multiplies_expected_but_not_copy_counts():
     np.testing.assert_allclose(visible.expected,
                                plain.expected * np.array([[4., 6.], [6., 9.]]))
     np.testing.assert_allclose(visible.total_copy_pairs, plain.total_copy_pairs)
+
+
+def test_synthetic_null_recovers_cn_independent_oe_after_sum_aggregation():
+    rng = np.random.default_rng(7)
+    cn = np.repeat([1., 2., 4., 8.], 10)
+    expected = 200. * np.outer(cn, cn)
+    observed = rng.poisson(expected)
+    _, _, coarse, valid = aggregate_observed_expected(
+        observed, expected, np.ones(len(cn), dtype=bool), factor=5)
+    upper = np.triu_indices_from(coarse, 1)
+    residual = coarse[upper]
+    coarse_cn = cn.reshape(-1, 5).mean(axis=1)
+    cn_product = np.outer(coarse_cn, coarse_cn)[upper]
+    assert abs(np.median(residual) - 1.) < 0.01
+    assert abs(np.corrcoef(residual, cn_product)[0, 1]) < 0.15
+
+
+def test_synthetic_compartment_survives_expected_correction():
+    from cnv_latent_ssm.features import compute_interaction_profile_correlation
+
+    n = 40
+    state = np.tile(np.r_[np.ones(5), -np.ones(5)], 4)
+    cn = np.repeat([1., 2., 4., 8.], 10)
+    expected = 100. * np.outer(cn, cn)
+    compartment = np.where(np.equal.outer(state, state), 1.5, 0.7)
+    oe = expected * compartment / expected
+    distance = np.abs(np.arange(n)[:, None] - np.arange(n)[None, :])
+    correlation = compute_interaction_profile_correlation(
+        oe, np.ones(n, dtype=bool), log_transform=True,
+        winsorize_quantile=1., pair_mask=distance >= 3)
+    eigenvalues, eigenvectors = np.linalg.eigh(correlation)
+    recovered = eigenvectors[:, np.argmax(eigenvalues)]
+    assert abs(np.corrcoef(recovered, state)[0, 1]) > 0.8
 
 
 def test_source_flow_is_not_absorbed_into_junction_flow():

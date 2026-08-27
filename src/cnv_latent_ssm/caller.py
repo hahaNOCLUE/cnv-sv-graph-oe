@@ -16,7 +16,12 @@ from .features import (
     extract_pca_observation_features,
     identify_valid_bins,
 )
-from .graph_expected import compute_copy_flow_additive_oe, estimate_native_decay
+from .graph_expected import (
+    compute_copy_flow_additive_oe,
+    estimate_native_decay,
+    fit_collision_floor,
+    subtract_baseline_collision,
+)
 from .trans_external import fit_trans_external_from_cooler
 from .ssm import CNVAwareSSM, SSMResults
 
@@ -463,20 +468,38 @@ def run_cnv_latent_ssm(
         baseline_bins = np.isfinite(cn_raw) & (
             np.abs(cn_raw - ploidy) <= max(0.25 * ploidy, 0.25))
         background = np.outer(baseline_bins, baseline_bins)
-        native_decay = estimate_native_decay(
+        baseline_decay = estimate_native_decay(
             raw_matrix, valid_mask=valid_mask, background_mask=background)
-        collision_floor = None
+        trans_floor = 0.0
         if copy_flow_trans_cnv is not None:
-            collision_floor, _ = fit_trans_external_from_cooler(
+            trans_floor, _ = fit_trans_external_from_cooler(
                 cooler_path, resolution, copy_flow_trans_cnv, ploidy=ploidy)
+        preliminary_decay = subtract_baseline_collision(
+            baseline_decay, trans_floor, ploidy)
+        _, preliminary = compute_copy_flow_additive_oe(
+            raw_matrix, bins_df, valid_mask, cn_raw, walk_nodes,
+            preliminary_decay, resolution, collision_floor=trans_floor,
+            ploidy=ploidy)
+        index = np.arange(len(valid_mask))
+        minimum_bins = max(int(np.ceil(10_000_000 / resolution)), 1)
+        intra_fit_mask = ((preliminary.cis_copy_pairs <= 0)
+                          & (np.abs(index[:, None] - index[None, :])
+                             >= minimum_bins))
+        collision_floor = fit_collision_floor(
+            raw_matrix, preliminary.external_copy_pairs, valid_mask,
+            intra_fit_mask)
+        same_molecule_decay = subtract_baseline_collision(
+            baseline_decay, collision_floor, ploidy)
         oe_matrix, copy_flow_result = compute_copy_flow_additive_oe(
             raw_matrix, bins_df, valid_mask, cn_raw, walk_nodes,
-            native_decay, resolution, collision_floor=collision_floor,
+            same_molecule_decay, resolution, collision_floor=collision_floor,
             ploidy=ploidy)
         logger.info(
             "Using oriented additive copy-flow O/E from %d peeled walk nodes "
-            "(inter-molecular collision floor %.6g).", len(walk_nodes),
-            copy_flow_result.collision_floor)
+            "(intra collision floor %.6g; trans anchor %.6g; kappa %.3f).",
+            len(walk_nodes), copy_flow_result.collision_floor, trans_floor,
+            (copy_flow_result.collision_floor / trans_floor
+             if trans_floor > 0 else np.nan))
     elif sv_distance_oe:
         if sv_file is None:
             raise ValueError("sv_distance_oe requires sv_file")

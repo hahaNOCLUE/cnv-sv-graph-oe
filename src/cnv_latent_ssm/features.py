@@ -238,8 +238,14 @@ def compute_interaction_profile_correlation(
     valid_mask: np.ndarray,
     log_transform: bool = True,
     winsorize_quantile: float = 0.999,
+    pair_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Compute whole-chromosome interaction-profile correlation matrix S."""
+    """Compute interaction-profile correlation, optionally from selected pairs.
+
+    ``pair_mask[i, k]`` selects observation columns for row ``i``. Correlation
+    of rows i and j uses columns eligible for both, allowing local reference-
+    or graph-distance contacts to be excluded from compartment inference.
+    """
     n = oe_matrix.shape[0]
     mat = oe_matrix.copy()
 
@@ -251,6 +257,28 @@ def compute_interaction_profile_correlation(
     if len(valid_vals) > 0:
         high = np.quantile(valid_vals, winsorize_quantile)
         mat = np.clip(mat, 0.0, high)
+
+    if pair_mask is not None:
+        eligible = (np.asarray(pair_mask, bool)
+                    & np.outer(valid_mask, valid_mask))
+        if eligible.shape != mat.shape:
+            raise ValueError("pair_mask must match oe_matrix shape")
+        indices = np.flatnonzero(valid_mask)
+        S = np.zeros((n, n), dtype=float)
+        for a, i in enumerate(indices):
+            S[i, i] = 1.0
+            for j in indices[a + 1:]:
+                use = eligible[i] & eligible[j]
+                if use.sum() < 3:
+                    continue
+                left, right = mat[i, use], mat[j, use]
+                left = left - left.mean()
+                right = right - right.mean()
+                denominator = np.sqrt(np.dot(left, left) * np.dot(right, right))
+                if denominator > 1e-12:
+                    S[i, j] = S[j, i] = np.clip(
+                        np.dot(left, right) / denominator, -1.0, 1.0)
+        return S
 
     # Compute correlation on valid columns
     S = np.zeros((n, n), dtype=float)
