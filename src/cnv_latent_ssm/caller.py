@@ -17,6 +17,7 @@ from .features import (
     identify_valid_bins,
 )
 from .graph_expected import compute_copy_flow_additive_oe, estimate_native_decay
+from .trans_external import fit_trans_external_from_cooler
 from .ssm import CNVAwareSSM, SSMResults
 
 logger = logging.getLogger(__name__)
@@ -309,6 +310,7 @@ def run_cnv_latent_ssm(
     contact_graph_strength: float = 0.0,
     sv_distance_oe: bool = False,
     copy_flow_walks: Optional[str] = None,
+    copy_flow_trans_cnv: Optional[str] = None,
     sv_max_hops: Optional[int] = None,
     is_microc: bool = True,
     balance: bool = False,
@@ -463,13 +465,18 @@ def run_cnv_latent_ssm(
         background = np.outer(baseline_bins, baseline_bins)
         native_decay = estimate_native_decay(
             raw_matrix, valid_mask=valid_mask, background_mask=background)
+        collision_floor = None
+        if copy_flow_trans_cnv is not None:
+            collision_floor, _ = fit_trans_external_from_cooler(
+                cooler_path, resolution, copy_flow_trans_cnv, ploidy=ploidy)
         oe_matrix, copy_flow_result = compute_copy_flow_additive_oe(
             raw_matrix, bins_df, valid_mask, cn_raw, walk_nodes,
-            native_decay, resolution, ploidy=ploidy)
+            native_decay, resolution, collision_floor=collision_floor,
+            ploidy=ploidy)
         logger.info(
             "Using oriented additive copy-flow O/E from %d peeled walk nodes "
-            "(external beta %.3f).", len(walk_nodes),
-            copy_flow_result.external_beta)
+            "(inter-molecular collision floor %.6g).", len(walk_nodes),
+            copy_flow_result.collision_floor)
     elif sv_distance_oe:
         if sv_file is None:
             raise ValueError("sv_distance_oe requires sv_file")

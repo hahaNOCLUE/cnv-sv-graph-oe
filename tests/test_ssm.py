@@ -8,8 +8,22 @@ from cnv_latent_ssm.ssm import CNVAwareSSM
 from cnv_latent_ssm.graph_expected import (
     accumulate_oriented_walks,
     compute_copy_flow_additive_oe,
+    estimate_native_decay,
     flow_residuals,
 )
+
+
+def test_native_decay_uses_weighted_isotonic_not_running_minimum():
+    diagonal_values = np.array([100., 50., 1., 20., 10., 5.])
+    matrix = np.zeros((6, 6), dtype=float)
+    for distance, value in enumerate(diagonal_values):
+        rows = np.arange(6 - distance)
+        matrix[rows, rows + distance] = value
+        matrix[rows + distance, rows] = value
+    curve = estimate_native_decay(matrix, np.ones(6, bool))
+    assert np.all(np.diff(curve) <= 1e-12)
+    assert curve[2] > 1.0
+    assert curve[-1] > 1.0
 from cnv_latent_ssm.caller import (
     build_contact_knn_graph,
     identify_transition_breakpoints,
@@ -377,12 +391,47 @@ def test_additive_expected_partitions_total_copy_pair_pool():
     matrix = np.array([[20., 10.], [10., 20.]])
     _, result = compute_copy_flow_additive_oe(
         matrix, bins, np.ones(2, bool), np.array([2., 2.]), walks,
-        np.array([20., 10.]), 50_000, external_level=2., external_beta=1.)
+        np.array([20., 10.]), 50_000, collision_floor=2.)
     np.testing.assert_allclose(
         result.cis_copy_pairs + result.external_copy_pairs,
         result.total_copy_pairs)
     np.testing.assert_allclose(result.expected,
                                result.cis_expected + result.external_expected)
+
+
+def test_collision_floor_is_linear_in_intermolecular_copy_pairs():
+    from cnv_latent_ssm.graph_expected import fit_collision_floor
+
+    pairs = np.array([[1., 2., 4.], [2., 1., 3.], [4., 3., 1.]])
+    observed = 2.5 * pairs
+    observed[0, 2] = observed[2, 0] = 0.0
+    mask = np.ones_like(pairs, dtype=bool)
+    floor = fit_collision_floor(
+        observed, pairs, np.ones(3, dtype=bool), mask)
+    # Eligible zero pixels are part of the Poisson exposure denominator.
+    expected = (observed[0, 1] + observed[0, 2] + observed[1, 2]) / 9.0
+    np.testing.assert_allclose(floor, expected)
+
+
+def test_capture_visibility_multiplies_expected_but_not_copy_counts():
+    bins = pd.DataFrame({"start": [0, 50_000], "end": [50_000, 100_000]})
+    walks = pd.DataFrame({
+        "walk_id": [1, 1], "walk_cn": [1., 1.],
+        "circular": [False, False], "order": [1, 2],
+        "start": [0, 50_000], "end": [50_000, 100_000],
+        "strand": ["+", "+"],
+    })
+    matrix = np.ones((2, 2))
+    _, plain = compute_copy_flow_additive_oe(
+        matrix, bins, np.ones(2, bool), np.array([2., 2.]), walks,
+        np.array([20., 10.]), 50_000, collision_floor=2.)
+    _, visible = compute_copy_flow_additive_oe(
+        matrix, bins, np.ones(2, bool), np.array([2., 2.]), walks,
+        np.array([20., 10.]), 50_000, collision_floor=2.,
+        capture_visibility=np.array([2., 3.]))
+    np.testing.assert_allclose(visible.expected,
+                               plain.expected * np.array([[4., 6.], [6., 9.]]))
+    np.testing.assert_allclose(visible.total_copy_pairs, plain.total_copy_pairs)
 
 
 def test_source_flow_is_not_absorbed_into_junction_flow():

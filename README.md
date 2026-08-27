@@ -72,8 +72,8 @@ Hi-C / Micro-C ──────┼── Internal CNV (1D Coverage -> GAM/Poly
 `cnv_latent_ssm.graph_expected` implements the rearranged-genome expected model
 
 $$
-E_{ij}=\sum_p M_{ij,p}P_{\rm native}(d_{ij,p})
-       +(D_{ij}-M_{ij})^{\beta}P_{\rm ext},
+E_{ij}=q_iq_j\left[\sum_p M_{ij,p}P_{0}(d_{ij,p})
+       +B\,N^{\rm inter}_{ij}\right],
 \qquad D_{ij}=\frac{CN_iCN_j}{P^2}.
 $$
 
@@ -82,7 +82,9 @@ and `walk_cn`. Consequently, junction dosage comes from the upstream JCN/flow
 solution, deletion and inversion paths retain their physical orientation, and
 multiple alleles are summed rather than collapsed to one shortest path. Source
 or sink CN remains outside the derivative walks and therefore cannot create an
-SV contact contribution.
+SV contact contribution. The constant collision floor $B$ is estimated from
+graph-unconnected or genome-wide trans copy pairs; no CN exponent, compartment
+state, or freely fitted long-range bin effect enters the expected model.
 
 The older `compute_sv_distance_mixture_oe()` function is retained only for
 backward compatibility and hop-cap sensitivity diagnostics. It is not the

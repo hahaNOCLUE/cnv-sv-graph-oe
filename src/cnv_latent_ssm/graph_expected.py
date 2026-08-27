@@ -11,7 +11,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize_scalar
 
 
 @dataclass
@@ -22,30 +21,55 @@ class GraphExpectedResult:
     cis_copy_pairs: np.ndarray
     external_copy_pairs: np.ndarray
     total_copy_pairs: np.ndarray
-    external_level: float
-    external_beta: float
+    collision_floor: float
+    capture_visibility: np.ndarray
+
+
+def _weighted_nonincreasing_isotonic(values: np.ndarray,
+                                      weights: np.ndarray) -> np.ndarray:
+    """Weighted PAVA fit constrained to be non-increasing."""
+    values = np.asarray(values, float)
+    weights = np.asarray(weights, float)
+    blocks = []
+    for index, (value, weight) in enumerate(zip(values, weights)):
+        blocks.append([index, index + 1, float(value), float(weight)])
+        while len(blocks) >= 2 and blocks[-2][2] < blocks[-1][2]:
+            right = blocks.pop()
+            left = blocks.pop()
+            total_weight = left[3] + right[3]
+            mean = ((left[2] * left[3] + right[2] * right[3])
+                    / max(total_weight, 1e-12))
+            blocks.append([left[0], right[1], mean, total_weight])
+    fitted = np.empty(len(values), dtype=float)
+    for start, end, value, _ in blocks:
+        fitted[start:end] = value
+    return fitted
 
 
 def estimate_native_decay(matrix: np.ndarray, valid_mask: np.ndarray,
                           background_mask: Optional[np.ndarray] = None) -> np.ndarray:
-    """Estimate native P(d) only from caller-supplied background pixels."""
+    """Estimate native P(d) using weighted isotonic regression on log counts."""
     n = matrix.shape[0]
     valid = np.outer(valid_mask, valid_mask)
     if background_mask is not None:
         valid &= np.asarray(background_mask, dtype=bool)
     curve = np.full(n, np.nan, dtype=float)
+    counts = np.zeros(n, dtype=float)
     for distance in range(n):
         values = np.diag(matrix, k=distance)
         keep = np.diag(valid, k=distance)
-        positive = keep & np.isfinite(values) & (values >= 0)
+        positive = keep & np.isfinite(values) & (values > 0)
         if positive.any():
             curve[distance] = np.median(values[positive])
+            counts[distance] = positive.sum()
     supported = np.flatnonzero(np.isfinite(curve) & (curve > 0))
     if not len(supported):
         raise ValueError("no supported native-distance background pixels")
-    curve = np.interp(np.arange(n), supported, curve[supported])
-    # A native decay curve must not increase with genomic distance.
-    return np.minimum.accumulate(curve)
+    fitted_log = _weighted_nonincreasing_isotonic(
+        np.log(curve[supported]), counts[supported])
+    # Interpolation occurs after fitting, so an isolated low diagonal cannot
+    # permanently drag every more-distal expected value downward.
+    return np.exp(np.interp(np.arange(n), supported, fitted_log))
 
 
 def _walk_bin_coordinates(bins: pd.DataFrame, walk: pd.DataFrame):
@@ -109,29 +133,18 @@ def accumulate_oriented_walks(bins: pd.DataFrame, walk_nodes: pd.DataFrame,
     return cis_expected, cis_pairs
 
 
-def fit_external_exposure(matrix: np.ndarray, external_pairs: np.ndarray,
-                          valid_mask: np.ndarray, unconnected_mask: np.ndarray,
-                          beta_bounds=(0.25, 1.5)):
-    """Fit P_ext and CN exponent from graph-unconnected copy pairs."""
+def fit_collision_floor(matrix: np.ndarray, intermolecular_pairs: np.ndarray,
+                        valid_mask: np.ndarray,
+                        unconnected_mask: np.ndarray) -> float:
+    """Fit constant B in B*N_inter using graph-unconnected pixels only."""
     use = (np.outer(valid_mask, valid_mask) & unconnected_mask
-           & (external_pairs > 0))
+           & (intermolecular_pairs > 0))
     upper = np.triu(use, k=1)
     observed = matrix[upper].astype(float)
-    dosage = external_pairs[upper].astype(float)
+    dosage = intermolecular_pairs[upper].astype(float)
     if not len(observed):
-        raise ValueError("no graph-unconnected pairs available for P_ext")
-
-    def objective(beta):
-        powered = dosage ** beta
-        level = observed.sum() / max(powered.sum(), 1e-12)
-        mean = np.maximum(level * powered, 1e-12)
-        return float(np.sum(mean - observed * np.log(mean)))
-
-    fit = minimize_scalar(objective, bounds=beta_bounds, method="bounded")
-    beta = float(fit.x)
-    powered = dosage ** beta
-    level = float(observed.sum() / max(powered.sum(), 1e-12))
-    return level, beta
+        raise ValueError("no graph-unconnected pairs available for collision fit")
+    return float(observed.sum() / max(dosage.sum(), 1e-12))
 
 
 def compute_copy_flow_additive_oe(
@@ -142,12 +155,17 @@ def compute_copy_flow_additive_oe(
     walk_nodes: pd.DataFrame,
     native_decay: np.ndarray,
     resolution: int,
-    external_level: Optional[float] = None,
-    external_beta: float = 1.0,
+    collision_floor: Optional[float] = None,
     external_fit_mask: Optional[np.ndarray] = None,
     ploidy: float = 2.0,
+    capture_visibility: Optional[np.ndarray] = None,
 ):
-    """Compute O/E from additive same-molecule and external copy pools."""
+    """Compute O/E from physical copies, topology, distance and visibility.
+
+    ``capture_visibility`` must be an externally specified technical track
+    (for example mappability/MNase/GC recovery), never a free long-range bin
+    effect learned from the contact matrix.
+    """
     cis_expected, raw_cis_pairs = accumulate_oriented_walks(
         bins, walk_nodes, native_decay, resolution, ploidy)
     dosage = np.maximum(np.asarray(segment_cn, float) / ploidy, 0)
@@ -163,20 +181,32 @@ def compute_copy_flow_additive_oe(
     # Convert M/P to the same pair units as CN_i*CN_j/P^2 before subtraction.
     cis_pairs = cis_rel / ploidy
     external_pairs = np.maximum(total_pairs - cis_pairs, 0)
-    if external_level is None:
+    if capture_visibility is None:
+        visibility = np.ones(len(dosage), dtype=float)
+    else:
+        visibility = np.asarray(capture_visibility, float)
+        if visibility.shape != dosage.shape:
+            raise ValueError("capture_visibility must have one value per bin")
+        if np.any(~np.isfinite(visibility)) or np.any(visibility <= 0):
+            raise ValueError("capture_visibility must be finite and positive")
+    visibility_pair = np.outer(visibility, visibility)
+    if collision_floor is None:
         if external_fit_mask is None:
             external_fit_mask = raw_cis_pairs <= 0
-        external_level, external_beta = fit_external_exposure(
-            matrix, external_pairs, valid_mask, external_fit_mask)
-    external_expected = external_level * external_pairs ** external_beta
+        visibility_corrected = matrix / visibility_pair
+        collision_floor = fit_collision_floor(
+            visibility_corrected, external_pairs, valid_mask,
+            external_fit_mask)
+    external_expected = collision_floor * external_pairs
+    cis_expected *= visibility_pair
+    external_expected *= visibility_pair
     expected = cis_expected + external_expected
     usable = np.outer(valid_mask, valid_mask) & (expected > 0)
     oe = np.zeros_like(matrix, dtype=float)
     oe[usable] = matrix[usable] / expected[usable]
     return oe, GraphExpectedResult(
         expected, cis_expected, external_expected, cis_pairs,
-        external_pairs, total_pairs, float(external_level),
-        float(external_beta))
+        external_pairs, total_pairs, float(collision_floor), visibility)
 
 
 def flow_residuals(segment_cn: np.ndarray, incident_junction_cn: np.ndarray,

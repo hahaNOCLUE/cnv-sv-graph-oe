@@ -22,9 +22,9 @@ The source-preserving graph was newly decomposed with `gGnome::peel`: 66
 complete walks were exported, including four circular walks. A final 0.67 CN
 of open/source flow could not be peeled into a complete derivative walk and
 was deliberately left as source residual rather than absorbed into an SV.
-The external-contact model is still a global power law and fitted at the lower
-beta bound in this example, so this remains a diagnostic result rather than a
-recommended CALDER input.
+The external-contact model now uses a constant inter-molecular collision floor
+fitted from trans copy pairs. The strong residual CN trend in this chr18 run
+means it remains a diagnostic result rather than a recommended CALDER input.
 
 The additive model uses pair-pool-consistent units:
 
@@ -39,5 +39,5 @@ The NPZ arrays are:
 ```text
 oe, expected, cis_expected, external_expected,
 cis_copy_pairs, external_copy_pairs, total_copy_pairs,
-external_level, external_beta, pearson_500kb, cn, valid
+collision_floor, pearson_500kb, cn, valid
 ```
