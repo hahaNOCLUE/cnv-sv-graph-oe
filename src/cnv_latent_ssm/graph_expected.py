@@ -131,6 +131,7 @@ def fit_joint_same_decay(matrix: np.ndarray, valid_mask: np.ndarray,
     initial_log_p = _weighted_nonincreasing_isotonic(
         initial_log_p, np.ones_like(initial_log_p))
     x0 = np.r_[initial_log_p, np.log(initial_b)]
+    objective_scale = max(float(counts.sum()), 1.0)
 
     def objective(parameters):
         log_p = np.interp(log_distance, knot_x, parameters[:-1])
@@ -139,7 +140,9 @@ def fit_joint_same_decay(matrix: np.ndarray, valid_mask: np.ndarray,
         nll = np.sum(counts * mu - totals * np.log(np.maximum(mu, 1e-12)))
         prior = .5 * ((parameters[-1] - np.log(trans_collision_floor)) /
                       prior_log_sd) ** 2
-        return nll + prior
+        # Scaling does not change the optimum, but avoids SLSQP line-search
+        # failures on chromosome-scale count totals.
+        return (nll + prior) / objective_scale
 
     constraints = [
         {"type": "ineq", "fun": lambda x, i=i: x[i] - x[i + 1]}

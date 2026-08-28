@@ -51,8 +51,17 @@ def main():
                         help="Molecule-copy normalization P")
     parser.add_argument("--cnv-reference-ploidy", type=float, default=2.0,
                         help="CNVkit log2-to-CN reference scale")
+    parser.add_argument(
+        "--genome-cnv", type=Path,
+        default=ROOT / "result_2/compartment/CNVkit_F1_50kb/F1_50kb.cbs.cns",
+        help="Genome-wide segmented CNV file used for trans collision fitting",
+    )
+    parser.add_argument("--segment-file", default="F1_chr18.balanced_sequence_cn.tsv")
+    parser.add_argument("--walk-nodes-file", default="F1_chr18.gGnome_peel_walk_nodes.tsv")
     parser.add_argument("--min-walk-cn", type=float, default=0.0,
                         help="Discard complete peeled walks below this CN")
+    parser.add_argument("--external-decay-npz", type=Path,
+                        help="Fixed externally estimated same_decay and collision_floor")
     args = parser.parse_args()
     input_dir = args.input_dir.resolve()
     output_dir = (args.output_dir or input_dir / "copy_flow_additive_oe").resolve()
@@ -61,13 +70,14 @@ def main():
     bins = clr.bins().fetch(args.chrom).reset_index(drop=True)
     raw = np.asarray(clr.matrix(balance=False).fetch(args.chrom), float)
     weights = pd.to_numeric(bins.weight, errors="coerce").to_numpy()
-    segments = pd.read_csv(input_dir / "F1_chr18.balanced_sequence_cn.tsv", sep="\t")
+    segments = pd.read_csv(input_dir / args.segment_file, sep="\t")
+    segments = segments[segments.chrom.eq(args.chrom)].copy()
     centers = (bins.start.to_numpy() + bins.end.to_numpy()) / 2
     cn = np.full(len(bins), np.nan)
     for row in segments.itertuples():
         cn[(centers >= row.start) & (centers < row.end)] = row.balanced_sequence_cn
     valid = np.isfinite(weights) & (weights > 0) & np.isfinite(cn) & (cn >= .1)
-    nodes = pd.read_csv(input_dir / "F1_chr18.gGnome_peel_walk_nodes.tsv", sep="\t")
+    nodes = pd.read_csv(input_dir / args.walk_nodes_file, sep="\t")
     nodes = nodes[nodes.walk_cn >= args.min_walk_cn].copy()
     if nodes.empty:
         raise ValueError("no peeled walks remain after --min-walk-cn filtering")
@@ -78,13 +88,22 @@ def main():
     cool_path = str(ROOT / "result_2/F1/hic_results/mcool/F1.mcool")
     trans_collision_floor, trans_diagnostics = fit_trans_external_from_cooler(
         cool_path, RES,
-        str(ROOT / "result_2/compartment/CNVkit_F1_50kb/F1_50kb.cbs.cns"),
+        str(args.genome_cnv),
         ploidy=args.cnv_reference_ploidy)
     trans_diagnostics.to_csv(output_dir / "chr18.trans_external_fit_by_chrom_pair.tsv",
                              sep="\t", index=False)
-    same_decay, intra_collision_floor = fit_joint_same_decay(
-        raw, valid, np.outer(baseline, baseline), trans_collision_floor,
-        ploidy=ploidy)
+    if args.external_decay_npz:
+        external_decay = np.load(args.external_decay_npz)
+        same_decay = np.asarray(external_decay["same_decay"], float)
+        if len(same_decay) < len(raw):
+            same_decay = np.pad(same_decay, (0, len(raw) - len(same_decay)),
+                                mode="edge")
+        same_decay = same_decay[:len(raw)]
+        intra_collision_floor = float(external_decay["collision_floor"])
+    else:
+        same_decay, intra_collision_floor = fit_joint_same_decay(
+            raw, valid, np.outer(baseline, baseline), trans_collision_floor,
+            ploidy=ploidy)
     kappa = intra_collision_floor / trans_collision_floor
     oe, result = compute_copy_flow_additive_oe(
         raw, bins, valid, cn, nodes, same_decay, RES,

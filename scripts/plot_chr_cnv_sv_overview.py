@@ -30,9 +30,11 @@ def parse_args() -> argparse.Namespace:
         default=ROOT
         / "code/cnv_latent_ssm/examples/F1_chrX/input_tables/F1_chrX.balanced_junction_cn.tsv",
     )
+    parser.add_argument("--cnr", type=Path,
+                        help="Optional continuous per-bin CNVkit-style CNR")
     parser.add_argument("--ploidy", type=float, default=2.0)
-    parser.add_argument("--centromere-start", type=float, default=58_055_932)
-    parser.add_argument("--centromere-end", type=float, default=63_829_925)
+    parser.add_argument("--centromere-start", type=float, default=58_100_000)
+    parser.add_argument("--centromere-end", type=float, default=63_800_000)
     parser.add_argument(
         "--output",
         type=Path,
@@ -49,6 +51,13 @@ def main() -> None:
     if cnv.empty:
         raise ValueError(f"No CNV segments found for {args.chrom}")
     cnv["copy_number"] = args.ploidy * np.exp2(pd.to_numeric(cnv["log2"]))
+    bins = None
+    if args.cnr is not None:
+        bins = pd.read_csv(args.cnr, sep="\t")
+        bins = bins.loc[bins["chromosome"].astype(str).eq(args.chrom)].copy()
+        bins["copy_number"] = args.ploidy * np.exp2(
+            pd.to_numeric(bins["log2"], errors="coerce")
+        )
 
     sv = pd.read_csv(args.junctions, sep="\t")
     sv = sv.loc[sv["chrom1"].eq(args.chrom) | sv["chrom2"].eq(args.chrom)].copy()
@@ -66,6 +75,10 @@ def main() -> None:
         gridspec_kw={"height_ratios": [1.15, 2.1], "hspace": 0.08},
     )
 
+    if bins is not None and not bins.empty:
+        centers = (bins["start"].to_numpy(float) + bins["end"].to_numpy(float)) / 2e6
+        ax_cn.scatter(centers, bins["copy_number"], s=5, color="#9ecae1",
+                      alpha=.55, linewidths=0, label="50-kb CNV bins", zorder=1)
     for row in cnv.itertuples():
         ax_cn.plot(
             [row.start / 1e6, row.end / 1e6],
@@ -83,7 +96,10 @@ def main() -> None:
         )
     ax_cn.axhline(args.ploidy, color="0.35", lw=1, ls="--", label=f"CN={args.ploidy:g}")
     ax_cn.set_ylabel("copy number")
-    ax_cn.set_ylim(0, max(3.0, float(cnv["copy_number"].max()) * 1.18))
+    bin_max = (float(bins["copy_number"].max()) if bins is not None and
+               not bins.empty else 0.0)
+    ax_cn.set_ylim(0, max(3.0, float(cnv["copy_number"].max()) * 1.18,
+                          bin_max * 1.08))
     ax_cn.legend(frameon=False, loc="upper right")
     ax_cn.set_title(f"F1 {args.chrom}: CNV and balanced EagleC2 SV overview")
 
@@ -95,11 +111,11 @@ def main() -> None:
     cent_start = args.centromere_start / 1e6
     cent_end = args.centromere_end / 1e6
     for axis in (ax_cn, ax_sv):
-        axis.axvspan(cent_start, cent_end, color="0.55", alpha=0.20, zorder=0)
+        axis.axvspan(cent_start, cent_end, color="0.45", alpha=0.22, zorder=0)
     ax_cn.text(
         (cent_start + cent_end) / 2,
         0.97,
-        f"centromere\n{cent_start:.1f}-{cent_end:.1f} Mb",
+        f"hg38 acen\n{cent_start:.1f}-{cent_end:.1f} Mb",
         transform=ax_cn.get_xaxis_transform(),
         ha="center",
         va="top",
