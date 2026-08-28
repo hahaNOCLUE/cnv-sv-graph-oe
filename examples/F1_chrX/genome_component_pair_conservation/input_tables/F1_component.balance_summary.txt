@@ -1,0 +1,13 @@
+target_chrom	chrX
+component_chromosomes	23
+segments	782
+reference_edges	759
+sv_edges	184
+interchrom_sv_edges	93
+junction_support_beta	117.7590865
+reference_adjacent_beta_diagnostic	308
+max_flow_residual_cn	8.881784197e-16
+total_junction_cn	7.188396356
+source_telomere_cn	77.18210016
+source_unresolved_cn	392.8201037
+source_forbidden_cn	0

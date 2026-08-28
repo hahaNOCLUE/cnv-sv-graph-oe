@@ -437,6 +437,27 @@ def test_additive_expected_partitions_total_copy_pair_pool():
                                result.cis_expected + result.external_expected)
 
 
+def test_duplication_keeps_all_same_molecule_occurrence_pairs():
+    bins = pd.DataFrame({"start": [0, 50_000], "end": [50_000, 100_000]})
+    # A occurs twice on one derivative molecule, followed by one B occurrence.
+    walks = pd.DataFrame({
+        "walk_id": [1, 1, 1], "walk_cn": [1., 1., 1.],
+        "circular": [False] * 3, "order": [1, 2, 3],
+        "start": [0, 0, 50_000], "end": [50_000, 50_000, 100_000],
+        "strand": ["+", "+", "+"],
+    })
+    _, result = compute_copy_flow_additive_oe(
+        np.ones((2, 2)), bins, np.ones(2, bool), np.array([2., 1.]),
+        walks, np.array([100., 10., 4.]), 50_000,
+        collision_floor=1., ploidy=2.)
+    # Two A-B occurrence pairs each contribute walk_cn/P=0.5 in raw units;
+    # conversion to total-pair units divides their sum by P once more.
+    np.testing.assert_allclose(result.cis_copy_pairs[0, 1], .5)
+    np.testing.assert_allclose(result.total_copy_pairs[0, 1], .5)
+    # Their distinct contour distances (one and two bins) are both retained.
+    np.testing.assert_allclose(result.cis_expected[0, 1], .5 * 10. + .5 * 4.)
+
+
 def test_collision_floor_is_linear_in_intermolecular_copy_pairs():
     from cnv_latent_ssm.graph_expected import fit_collision_floor
 

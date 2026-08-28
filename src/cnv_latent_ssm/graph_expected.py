@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -292,14 +293,22 @@ def compute_copy_flow_additive_oe(
         bins, walk_nodes, native_decay, resolution, ploidy)
     dosage = np.maximum(np.asarray(segment_cn, float) / ploidy, 0)
     total_pairs = np.outer(dosage, dosage)
-    # raw_cis_pairs is a relative molecule multiplicity M/P, whereas
-    # total_pairs is a relative copy-pair pool CN_i*CN_j/P^2.  Cap M/P by the
-    # copies available at either endpoint; do not compare it to total_pairs.
-    max_cis_rel = np.minimum(dosage[:, None], dosage[None, :])
-    cis_rel = np.minimum(raw_cis_pairs, max_cis_rel)
-    scale = np.divide(cis_rel, raw_cis_pairs, out=np.zeros_like(cis_rel),
-                      where=raw_cis_pairs > 0)
-    cis_expected *= scale
+    # raw_cis_pairs is occurrence-pair multiplicity M_occ/P. Repeated copies
+    # of a locus on one derivative molecule are distinct physical pairs, so
+    # min(CN_i, CN_j) is not a valid cap. Convert to total-pair units and only
+    # check nominal copy-pair conservation. With fractional/subclonal CN,
+    # CN_i*CN_j is a product of marginal dosages and is not a strict joint
+    # upper bound, so violations are diagnostic and must not erase walk mass.
+    max_cis_rel = total_pairs * ploidy
+    tolerance = 1e-8 + 1e-6 * max_cis_rel
+    excess = raw_cis_pairs > max_cis_rel + tolerance
+    if np.any(excess):
+        warnings.warn(
+            f"same-molecule occurrence mass exceeds total copy-pair mass at "
+            f"{int(excess.sum())} pixels; retained because fractional CN "
+            f"marginals do not define joint clone occupancy",
+            RuntimeWarning)
+    cis_rel = raw_cis_pairs
     # Convert M/P to the same pair units as CN_i*CN_j/P^2 before subtraction.
     cis_pairs = cis_rel / ploidy
     external_pairs = np.maximum(total_pairs - cis_pairs, 0)

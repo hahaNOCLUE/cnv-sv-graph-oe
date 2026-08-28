@@ -148,15 +148,21 @@ def main():
 
     # Only true chromosome ends and CN discontinuities may retain unresolved
     # endpoint mass. Every known interchromosomal breakpoint is a real edge.
-    source_kind = np.full(nv, "unresolved", dtype=object)
+    source_kind = np.full(nv, "forbidden", dtype=object)
+    source_allowed = np.zeros(nv, dtype=bool)
     for chrom, group in segments.groupby("chrom", sort=False):
-        source_kind[2 * int(group.index[0])] = "telomere"
-        source_kind[2 * int(group.index[-1]) + 1] = "telomere"
+        left_end = 2 * int(group.index[0])
+        right_end = 2 * int(group.index[-1]) + 1
+        source_kind[[left_end, right_end]] = "telomere"
+        source_allowed[[left_end, right_end]] = True
     for left, right, _ in ref_rows:
-        if abs(seq_cn[left] - seq_cn[right]) >= .25:
-            source_kind[2 * left + 1] = "unresolved"
-            source_kind[2 * right] = "unresolved"
-    source_allowed = np.ones(nv, dtype=bool)
+        # Any actual CBS state transition may carry unresolved endpoint mass.
+        # SV-induced cuts inside one CN segment have identical CN and remain
+        # strictly source-forbidden.
+        if not np.isclose(seq_cn[left], seq_cn[right], rtol=1e-8, atol=1e-8):
+            vertices = [2 * left + 1, 2 * right]
+            source_kind[vertices] = "unresolved"
+            source_allowed[vertices] = True
 
     clr = cooler.Cooler(a.cool_uri)
     support = [local_support(clr, r.chrom1, r.pos1, r.orientation[0],
@@ -230,7 +236,11 @@ def main():
         eq_values.extend((1.0, -1.0, 1.0)); eq_rhs.append(cn_targets[j])
     equality = sparse.csr_matrix(
         (eq_values, (eq_rows, eq_cols)), shape=(len(eq_rhs), nvar))
-    bounds = [(0, float(u)) for u in upper] + [(0, None)] * (nvar - off_source)
+    source_bounds = [(0, None) if allowed else (0, 0)
+                     for allowed in source_allowed]
+    deviation_bounds = [(0, None)] * (4 * nj)
+    bounds = ([(0, float(u)) for u in upper] + source_bounds
+              + deviation_bounds)
     fit = linprog(objective, A_eq=equality, b_eq=np.asarray(eq_rhs),
                   bounds=bounds, method="highs")
     if not fit.success:

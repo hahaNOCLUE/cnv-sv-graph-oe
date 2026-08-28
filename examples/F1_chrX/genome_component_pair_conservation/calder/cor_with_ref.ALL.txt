@@ -1,0 +1,2 @@
+chr	50kb	100kb	opt_binsize
+chrX	0.35489	0.36353	50kb
