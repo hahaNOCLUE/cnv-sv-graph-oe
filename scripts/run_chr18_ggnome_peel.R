@@ -162,7 +162,7 @@ walks <- if (export_cache) {
   readRDS(cache_file)
 } else {
   tryCatch(
-    peel(gg, field = NULL, embed.loops = FALSE, verbose = TRUE,
+    peel(gg, field = NULL, embed.loops = TRUE, verbose = TRUE,
          cache.path = cache_file),
     error = function(e) {
       if (!file.exists(cache_file)) stop(e)
