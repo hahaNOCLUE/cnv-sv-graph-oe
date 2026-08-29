@@ -1,0 +1,19 @@
+converged	True
+iterations	1
+global_scale	1.7389094323963288
+fit_pixel_count	98278
+holdout_pixel_count	24628
+fit_supported_bins	1092
+excluded_bins	1913
+q_min_observed	1.0
+q_max_observed	1.0
+row_ratio_cv	0.4321327946597827
+holdout_supported_bins_before	1097
+holdout_supported_bins_after	1097
+holdout_row_ratio_cv_q1	0.487043973481476
+holdout_row_ratio_cv_fitted_q	0.487043973481476
+q_at_lower_bound_fraction	1.0
+q_at_upper_bound_fraction	1.0
+corr_log_q_cn	
+corr_pc1_q_signed	
+corr_pc1_q_abs	

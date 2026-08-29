@@ -56,6 +56,35 @@ sv <- fread(file.path(indir, paste0(prefix, ".balanced_junction_cn.tsv")))
 target_chrom <- unique(seg$chrom)
 if (!"is_external" %in% names(sv)) sv[, is_external := FALSE]
 
+input_files <- c(
+  sequence = file.path(indir, paste0(prefix, ".balanced_sequence_cn.tsv")),
+  reference = file.path(indir, paste0(prefix, ".balanced_reference_cn.tsv")),
+  junction = file.path(indir, paste0(prefix, ".balanced_junction_cn.tsv"))
+)
+source_name <- if (component_mode) "F1_component.source_cn.tsv" else
+  "F1_chr18.source_slack_cn.tsv"
+input_files <- c(input_files, source = file.path(indir, source_name))
+input_md5 <- unname(tools::md5sum(input_files))
+fingerprint_payload <- c(
+  paste(names(input_files), normalizePath(input_files), input_md5, sep = "\t"),
+  paste0("scale_cn\t", scale_cn),
+  "embed_loops\tTRUE"
+)
+fingerprint_file <- tempfile("ggnome-fingerprint-")
+writeLines(fingerprint_payload, fingerprint_file)
+graph_fingerprint <- unname(tools::md5sum(fingerprint_file))
+unlink(fingerprint_file)
+manifest <- data.table(
+  graph_fingerprint = graph_fingerprint,
+  role = names(input_files),
+  path = normalizePath(input_files),
+  md5 = input_md5,
+  scale_cn = scale_cn,
+  embed_loops = TRUE
+)
+fwrite(manifest,
+       file.path(indir, paste0(prefix, ".gGnome_run_manifest.tsv")), sep = "\t")
+
 nodes <- GRanges(seg$chrom, IRanges(seg$start + 1L, seg$end))
 mcols(nodes)$segment_id <- seg$segment_id
 
@@ -132,8 +161,7 @@ target_node_cn <- c(round(seg$balanced_sequence_cn * scale_cn), external_cn)
 projected_node_cn <- pmax(target_node_cn, side_flow[, "L"], side_flow[, "R"])
 mcols(nodes)$cn <- projected_node_cn
 
-source_file <- if (component_mode) "F1_component.source_cn.tsv" else "F1_chr18.source_slack_cn.tsv"
-source_before <- fread(file.path(indir, source_file))
+source_before <- fread(file.path(indir, source_name))
 source_after <- data.table(
   segment_id = rep(seg$segment_id, each = 2L), chrom = rep(seg$chrom, each = 2L),
   side = rep(c("L", "R"), nrow(seg)),
@@ -156,9 +184,15 @@ gg <- gG(nodes = nodes, edges = edges,
          meta = list(name = paste("F1 component", length(target_chrom), "chromosomes"), y.field = "cn"))
 saveRDS(gg, file.path(indir, paste0(prefix, ".gGnome_graph.scaled100.rds")))
 
-cache_file <- file.path(indir, paste0(prefix, ".gGnome_peel.cache.rds"))
+cache_file <- file.path(
+  indir,
+  paste0(prefix, ".gGnome_peel.", graph_fingerprint, ".cache.rds")
+)
 export_cache <- length(args) >= 2L && args[[2]] == "--export-cache"
 walks <- if (export_cache) {
+  if (!file.exists(cache_file)) {
+    stop("No peel cache matches graph fingerprint ", graph_fingerprint)
+  }
   readRDS(cache_file)
 } else {
   tryCatch(
@@ -173,6 +207,8 @@ walks <- if (export_cache) {
   )
 }
 saveRDS(walks, file.path(indir, paste0(prefix, ".gGnome_peel_walks.rds")))
+writeLines(graph_fingerprint,
+           file.path(indir, paste0(prefix, ".gGnome_peel.graph_fingerprint.txt")))
 
 walk_dt <- copy(walks$dt)
 walk_dt[, walk_cn := cn / scale_cn]

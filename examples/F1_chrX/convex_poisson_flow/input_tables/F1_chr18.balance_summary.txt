@@ -1,0 +1,40 @@
+sequence_cn_source	CNVkit CBS .cns
+sequence_cn_conversion	CN=ploidy*2^log2
+nominal_ploidy	2.0
+reference_ploidy_cap	None
+breakpoint_reference_ploidy_cap	None
+sequence_cn_optimization	fixed
+sv_read_likelihood	Poisson
+chromosome	X
+parent_cnv_segments	50
+graph_sequence_segments	68
+sv_edges	21
+intrachrom_sv_edges	21
+interchrom_sv_edges	0
+cnv_snap_tolerance_bp	100000
+cnv_snap_min_jump	0.25
+cnv_snapped_boundaries	22
+optimization_model	convex_shared-yield Poisson hard-flow
+objective	Poisson_NLL_plus_L1_source
+flow_conservation	hard_equality
+eaglec_probability_role	candidate_selection_only
+cn_junction_target	disabled
+reciprocal_continuation	disabled_fixed_zero
+source_penalty	1000.0
+source_penalty_form	L1
+ordinary_internal_source	hard_zero
+non_cn_step_paired_breakend_source	hard_zero
+cn_step_latent_endpoint	allowed_L1
+telomere_source_penalty	0.0
+junction_window_bp	50000
+shared_junction_yield_a	700.765774417
+background_model	local_background_pairs
+solver_status	CVXPY CLARABEL: optimal
+objective_value	29851.34458
+max_flow_residual_cn	2.895279394e-07
+total_junction_cn	10.7247556
+total_source_cn	94.4529654
+total_generic_source_cn	94.45296538
+total_reciprocal_source_cn	2.536163317e-08
+ordinary_side_median_connected_fraction	0.9388562998
+ordinary_boundary_median_reference_ratio	0.999999767
