@@ -26,6 +26,7 @@ class GraphExpectedResult:
     collision_floor: float
     capture_visibility: np.ndarray
     min_graph_distance_bins: np.ndarray
+    visibility_band_cis_expected: np.ndarray
 
 
 def _weighted_nonincreasing_isotonic(values: np.ndarray,
@@ -215,7 +216,9 @@ def _walk_bin_coordinates(bins: pd.DataFrame, walk: pd.DataFrame):
 
 def accumulate_oriented_walks(bins: pd.DataFrame, walk_nodes: pd.DataFrame,
                               native_decay: np.ndarray, resolution: int,
-                              ploidy: float = 2.0):
+                              ploidy: float = 2.0,
+                              visibility_distance_bp=(500_000, 5_000_000),
+                              return_visibility_band: bool = False):
     """Sum copy-specific P(d) over all oriented derivative walks.
 
     Each walk contributes independently. A deletion junction therefore gives
@@ -229,6 +232,7 @@ def accumulate_oriented_walks(bins: pd.DataFrame, walk_nodes: pd.DataFrame,
         raise ValueError(f"walk_nodes missing columns: {sorted(missing)}")
     n = len(bins)
     cis_expected = np.zeros((n, n), dtype=float)
+    visibility_band_expected = np.zeros((n, n), dtype=float)
     cis_pairs = np.zeros((n, n), dtype=float)
     min_distance = np.full((n, n), np.inf, dtype=float)
     for _, walk in walk_nodes.groupby("walk_id", sort=False):
@@ -251,8 +255,16 @@ def accumulate_oriented_walks(bins: pd.DataFrame, walk_nodes: pd.DataFrame,
         cols = np.broadcast_to(ids[None, :], distance_bins.shape).ravel()
         np.add.at(cis_expected, (rows, cols),
                   (copy * native_decay[distance_bins]).ravel())
+        in_visibility_band = ((distance >= visibility_distance_bp[0])
+                              & (distance <= visibility_distance_bp[1]))
+        np.add.at(visibility_band_expected, (rows, cols),
+                  (copy * native_decay[distance_bins]
+                   * in_visibility_band).ravel())
         np.add.at(cis_pairs, (rows, cols), copy)
         np.minimum.at(min_distance, (rows, cols), distance_bins.ravel())
+    if return_visibility_band:
+        return (cis_expected, cis_pairs, min_distance,
+                visibility_band_expected)
     return cis_expected, cis_pairs, min_distance
 
 
@@ -289,8 +301,10 @@ def compute_copy_flow_additive_oe(
     (for example mappability/MNase/GC recovery), never a free long-range bin
     effect learned from the contact matrix.
     """
-    cis_expected, raw_cis_pairs, min_graph_distance = accumulate_oriented_walks(
-        bins, walk_nodes, native_decay, resolution, ploidy)
+    (cis_expected, raw_cis_pairs, min_graph_distance,
+     visibility_band_cis_expected) = accumulate_oriented_walks(
+        bins, walk_nodes, native_decay, resolution, ploidy,
+        return_visibility_band=True)
     dosage = np.maximum(np.asarray(segment_cn, float) / ploidy, 0)
     total_pairs = np.outer(dosage, dosage)
     # raw_cis_pairs is occurrence-pair multiplicity M_occ/P. Repeated copies
@@ -330,6 +344,7 @@ def compute_copy_flow_additive_oe(
             external_fit_mask)
     external_expected = collision_floor * external_pairs
     cis_expected *= visibility_pair
+    visibility_band_cis_expected *= visibility_pair
     external_expected *= visibility_pair
     expected = cis_expected + external_expected
     usable = np.outer(valid_mask, valid_mask) & (expected > 0)
@@ -338,7 +353,7 @@ def compute_copy_flow_additive_oe(
     return oe, GraphExpectedResult(
         expected, cis_expected, external_expected, cis_pairs,
         external_pairs, total_pairs, float(collision_floor), visibility,
-        min_graph_distance)
+        min_graph_distance, visibility_band_cis_expected)
 
 
 def flow_residuals(segment_cn: np.ndarray, incident_junction_cn: np.ndarray,

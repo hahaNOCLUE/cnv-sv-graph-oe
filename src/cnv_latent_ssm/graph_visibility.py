@@ -21,31 +21,32 @@ class GraphVisibilityResult:
 def build_graph_visibility_mask(
     observed: np.ndarray,
     graph_expected: np.ndarray,
-    cis_expected: np.ndarray,
-    graph_distance_bins: np.ndarray,
+    visibility_band_cis_expected: np.ndarray,
     valid_bins: np.ndarray,
-    resolution: int,
     excluded_bins: np.ndarray | None = None,
-    min_distance_bp: int = 500_000,
-    max_distance_bp: int = 5_000_000,
+    excluded_pairs: np.ndarray | None = None,
+    minimum_band_fraction: float = 0.9,
     enrichment_quantile: float = 0.995,
 ) -> np.ndarray:
-    """Select reliable graph-cis pixels for visibility estimation."""
+    """Select pixels dominated by 0.5--5 Mb same-molecule exposure."""
     valid_bins = np.asarray(valid_bins, bool)
     if excluded_bins is None:
         excluded_bins = np.zeros(len(valid_bins), bool)
+    if excluded_pairs is None:
+        excluded_pairs = np.zeros_like(observed, bool)
     eligible_bins = valid_bins & ~np.asarray(excluded_bins, bool)
-    distance_bp = np.asarray(graph_distance_bins, float) * resolution
+    band_fraction = np.divide(
+        visibility_band_cis_expected, graph_expected,
+        out=np.zeros_like(graph_expected, float), where=graph_expected > 0)
     mask = (
         np.outer(eligible_bins, eligible_bins)
+        & ~np.asarray(excluded_pairs, bool)
         & np.isfinite(observed)
         & (observed >= 0)
         & np.isfinite(graph_expected)
         & (graph_expected > 0)
-        & np.isfinite(distance_bp)
-        & (distance_bp >= min_distance_bp)
-        & (distance_bp <= max_distance_bp)
-        & (cis_expected > 0)
+        & np.isfinite(band_fraction)
+        & (band_fraction >= minimum_band_fraction)
     )
     np.fill_diagonal(mask, False)
     if not np.any(mask):
@@ -64,6 +65,20 @@ def build_graph_visibility_mask(
             mask &= initial_ratio <= upper
     # Make the mask exactly symmetric even if a sparse input was asymmetric.
     return mask & mask.T
+
+
+def split_visibility_mask(mask: np.ndarray, holdout_fraction: float = 0.2):
+    """Deterministically split symmetric pair pixels into train and holdout."""
+    if not 0 <= holdout_fraction < 1:
+        raise ValueError("holdout_fraction must lie in [0, 1)")
+    mask = np.asarray(mask, bool)
+    rows, cols = np.indices(mask.shape)
+    # A symmetric integer hash avoids run-to-run random split variation.
+    left, right = np.minimum(rows, cols), np.maximum(rows, cols)
+    hashed = (left * 73856093 + right * 19349663) % 10_000
+    holdout = mask & (hashed < int(round(10_000 * holdout_fraction)))
+    train = mask & ~holdout
+    return train, holdout
 
 
 def fit_graph_visibility(

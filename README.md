@@ -91,11 +91,13 @@ $$
 $$
 
 `cnv_latent_ssm.graph_visibility` estimates bounded technical visibility
-$0.5\le q_i\le2$ only from graph-supported cis pixels with contour distance
-0.5--5 Mb. SV-adjacent, centromeric, unresolved-topology, and extreme local
-enrichment pixels are excluded. Neither CN state nor reference long-range
-contacts enter this fit. There is no pre-graph ICE/LOIC step, no post-O/E ICE,
-and no additional CAIC-like CN-response layer.
+$0.5\le q_i\le2$ only where at least 90% of physical expected exposure comes
+from same-molecule copy instances at contour distance 0.5--5 Mb. Pairwise
+SV-junction neighborhoods, centromeric and unresolved-topology bins, and
+extreme local enrichment pixels are excluded. A deterministic 20% pixel
+holdout tests whether the fitted visibility generalizes. Neither CN state nor
+reference long-range contacts enter this fit. There is no pre-graph ICE/LOIC
+step, no post-O/E ICE, and no additional CAIC-like CN-response layer.
 
 The older `compute_sv_distance_mixture_oe()` function is retained only for
 backward compatibility and hop-cap sensitivity diagnostics. It is not the

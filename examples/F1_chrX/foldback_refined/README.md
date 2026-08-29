@@ -6,10 +6,18 @@ matching, and explicit fold-back handling. The low-confidence call SV26 is
 deduplicated against the high-confidence `--` fold-back SV08. Fold-back source
 penalty 10 was used for the selected balance and gGnome peel.
 
-The `results` directory contains the CNV-bin/CBS/SV overview, the balance plot,
-the graph-aware CN-response O/E with standard unmasked 500-kb Pearson, and the
-local raw contact map for unmatched SV14. The external-decay directory contains
-the pooled copy-neutral autosome decay estimate used for follow-up comparison.
+The `results` directory also contains the current graph-aware visibility fit:
+`chrX.graph_visibility.tsv`, its convergence/holdout QC, and
+`chrX.graph_visibility.oe_and_pearson.png`. This fit uses a deterministic 80/20
+pixel split and requires at least 90% of expected exposure to come from
+same-molecule copy instances at 0.5--5 Mb contour distance. In this snapshot,
+holdout row-ratio CV improves from 0.337 with `q=1` to 0.230 with fitted `q`;
+`corr(log(q), CN)=0.006`. Reciprocal unknown continuation is represented by
+edge-specific mass constrained to `0 <= S_recip <= JCN`, so an unused SV
+candidate cannot open free source flow.
+
+The external-decay directory contains the pooled copy-neutral autosome decay
+estimate used for follow-up comparison.
 
 Large chromosome-scale observed/expected matrices and RDS cache files are not
 included. They can be regenerated from the scripts and the tables committed

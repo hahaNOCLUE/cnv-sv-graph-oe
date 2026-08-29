@@ -3,6 +3,7 @@ import numpy as np
 from cnv_latent_ssm.graph_visibility import (
     build_graph_visibility_mask,
     fit_graph_visibility,
+    split_visibility_mask,
 )
 
 
@@ -29,23 +30,25 @@ def test_graph_visibility_recovers_bounded_bin_effects():
     )
 
 
-def test_graph_visibility_mask_uses_graph_distance_and_exclusions():
+def test_graph_visibility_mask_requires_dominant_band_exposure():
     observed = np.ones((4, 4), float)
     expected = np.ones((4, 4), float)
-    cis = np.ones((4, 4), float)
-    distance = np.array([
-        [0, 10, 30, 120],
-        [10, 0, 60, 120],
-        [30, 60, 0, 20],
-        [120, 120, 20, 0],
-    ], float)
+    band = np.ones((4, 4), float)
+    band[0, 2] = band[2, 0] = .2
     excluded = np.array([False, False, False, True])
     mask = build_graph_visibility_mask(
-        observed, expected, cis, distance, np.ones(4, bool), 50_000,
-        excluded_bins=excluded, min_distance_bp=500_000,
-        max_distance_bp=5_000_000, enrichment_quantile=1,
+        observed, expected, band, np.ones(4, bool),
+        excluded_bins=excluded, minimum_band_fraction=.9,
+        enrichment_quantile=1,
     )
-    assert mask[0, 1]  # 10 graph bins = 0.5 Mb
-    assert mask[1, 2]  # 60 graph bins = 3 Mb
+    assert mask[0, 1]
+    assert not mask[0, 2]
+    assert mask[1, 2]
     assert not mask[0, 3]  # excluded endpoint bin
     assert not mask[0, 0]
+
+    train, holdout = split_visibility_mask(mask, .2)
+    assert not np.any(train & holdout)
+    np.testing.assert_array_equal(train | holdout, mask)
+    np.testing.assert_array_equal(train, train.T)
+    np.testing.assert_array_equal(holdout, holdout.T)

@@ -23,6 +23,7 @@ from cnv_latent_ssm.features import compute_interaction_profile_correlation  # n
 from cnv_latent_ssm.graph_visibility import (  # noqa: E402
     build_graph_visibility_mask,
     fit_graph_visibility,
+    split_visibility_mask,
 )
 from cnv_latent_ssm.trans_external import fit_trans_external_from_cooler  # noqa: E402
 
@@ -71,8 +72,8 @@ def main():
                         help="Discard complete peeled walks below this CN")
     parser.add_argument("--external-decay-npz", type=Path,
                         help="Fixed externally estimated same_decay and collision_floor")
-    parser.add_argument("--visibility-min-distance", type=int, default=500_000)
-    parser.add_argument("--visibility-max-distance", type=int, default=5_000_000)
+    parser.add_argument("--visibility-min-band-fraction", type=float, default=.9)
+    parser.add_argument("--visibility-holdout-fraction", type=float, default=.2)
     parser.add_argument("--visibility-breakpoint-padding", type=int, default=500_000)
     parser.add_argument("--visibility-unresolved-fraction", type=float, default=.05)
     parser.add_argument("--visibility-damping", type=float, default=.5)
@@ -132,17 +133,18 @@ def main():
         collision_floor=intra_collision_floor, ploidy=ploidy)
 
     excluded_visibility = np.zeros(len(bins), bool)
+    breakpoint_pair_exclusion = np.zeros_like(raw, bool)
     junction_path = input_dir / "F1_chr18.balanced_junction_cn.tsv"
     if junction_path.exists():
         junctions = pd.read_csv(junction_path, sep="\t")
-        breakpoint_positions = np.r_[
-            junctions.loc[junctions.chrom1.astype(str).eq(args.chrom), "pos1"],
-            junctions.loc[junctions.chrom2.astype(str).eq(args.chrom), "pos2"],
-        ].astype(float)
-        for position in breakpoint_positions:
-            excluded_visibility |= (
-                np.abs(centers - position) <= args.visibility_breakpoint_padding
-            )
+        intrachrom = junctions[
+            junctions.chrom1.astype(str).eq(args.chrom)
+            & junctions.chrom2.astype(str).eq(args.chrom)]
+        for row in intrachrom.itertuples():
+            left = np.abs(centers - float(row.pos1)) <= args.visibility_breakpoint_padding
+            right = np.abs(centers - float(row.pos2)) <= args.visibility_breakpoint_padding
+            breakpoint_pair_exclusion |= (np.outer(left, right)
+                                          | np.outer(right, left))
     source_path = input_dir / "F1_chr18.source_slack_cn.tsv"
     if source_path.exists():
         source = pd.read_csv(source_path, sep="\t")
@@ -157,14 +159,15 @@ def main():
     if args.chrom in ("X", "chrX"):
         excluded_visibility |= (centers >= 58_100_000) & (centers < 63_800_000)
 
-    visibility_mask = build_graph_visibility_mask(
-        raw, result.expected, result.cis_expected,
-        result.min_graph_distance_bins, valid, RES,
+    visibility_candidate_mask = build_graph_visibility_mask(
+        raw, result.expected, result.visibility_band_cis_expected, valid,
         excluded_bins=excluded_visibility,
-        min_distance_bp=args.visibility_min_distance,
-        max_distance_bp=args.visibility_max_distance,
+        excluded_pairs=breakpoint_pair_exclusion,
+        minimum_band_fraction=args.visibility_min_band_fraction,
         enrichment_quantile=args.visibility_loop_quantile,
     )
+    visibility_mask, visibility_holdout_mask = split_visibility_mask(
+        visibility_candidate_mask, args.visibility_holdout_fraction)
     visibility_fit = fit_graph_visibility(
         raw, result.expected, visibility_mask, valid,
         damping=args.visibility_damping,
@@ -190,6 +193,7 @@ def main():
                         external_expected=final_external_expected,
                         graph_cis_expected=result.cis_expected,
                         graph_external_expected=result.external_expected,
+                        visibility_band_cis_expected=result.visibility_band_cis_expected,
                         cis_copy_pairs=result.cis_copy_pairs,
                         external_copy_pairs=result.external_copy_pairs,
                         total_copy_pairs=result.total_copy_pairs,
@@ -205,6 +209,8 @@ def main():
                         capture_visibility=q,
                         global_scale=visibility_fit.scale,
                         visibility_fit_mask=visibility_mask,
+                        visibility_holdout_mask=visibility_holdout_mask,
+                        visibility_candidate_mask=visibility_candidate_mask,
                         visibility_excluded_bins=excluded_visibility,
                         visibility_supported_bins=visibility_fit.supported_bins,
                         visibility_converged=visibility_fit.converged,
@@ -264,13 +270,23 @@ def main():
     visibility_table["excluded"] = excluded_visibility
     visibility_table.to_csv(
         output_dir / f"{output_stem}.graph_visibility.tsv", sep="\t", index=False)
-    row_observed = np.where(visibility_mask, raw, 0).sum(axis=1)
-    row_expected = np.where(visibility_mask, final_expected, 0).sum(axis=1)
-    row_ratio = np.divide(row_observed, row_expected,
-                          out=np.full(len(q), np.nan), where=row_expected > 0)
+    def row_ratio_cv(mask, expected):
+        row_observed = np.where(mask, raw, 0).sum(axis=1)
+        row_expected = np.where(mask, expected, 0).sum(axis=1)
+        row_ratio = np.divide(row_observed, row_expected,
+                              out=np.full(len(q), np.nan), where=row_expected > 0)
+        use = np.isfinite(row_ratio) & (row_expected > 0)
+        return (float(np.nanstd(row_ratio[use]) /
+                      max(np.nanmean(row_ratio[use]), 1e-12)), row_ratio, use)
+
+    row_cv, row_ratio, row_use = row_ratio_cv(visibility_mask, final_expected)
+    baseline_scale = float(raw[visibility_mask].sum()
+                           / max(result.expected[visibility_mask].sum(), 1e-12))
+    holdout_cv_before, _, holdout_use_before = row_ratio_cv(
+        visibility_holdout_mask, baseline_scale * result.expected)
+    holdout_cv_after, _, holdout_use_after = row_ratio_cv(
+        visibility_holdout_mask, final_expected)
     supported = visibility_fit.supported_bins
-    row_cv = float(np.nanstd(row_ratio[supported]) /
-                   max(np.nanmean(row_ratio[supported]), 1e-12))
     q_cn_corr = float(np.corrcoef(np.log(q[supported]), cn[supported])[0, 1])
     eigvals, eigvecs = np.linalg.eigh(np.nan_to_num(pearson, nan=0.0))
     pc1_500 = eigvecs[:, np.argmax(eigvals)]
@@ -298,11 +314,20 @@ def main():
         "iterations": visibility_fit.iterations,
         "global_scale": visibility_fit.scale,
         "fit_pixel_count": int(visibility_mask.sum()),
+        "holdout_pixel_count": int(visibility_holdout_mask.sum()),
         "fit_supported_bins": int(supported.sum()),
         "excluded_bins": int(excluded_visibility.sum()),
         "q_min_observed": float(q[supported].min()),
         "q_max_observed": float(q[supported].max()),
         "row_ratio_cv": row_cv,
+        "holdout_supported_bins_before": int(holdout_use_before.sum()),
+        "holdout_supported_bins_after": int(holdout_use_after.sum()),
+        "holdout_row_ratio_cv_q1": holdout_cv_before,
+        "holdout_row_ratio_cv_fitted_q": holdout_cv_after,
+        "q_at_lower_bound_fraction": float(
+            np.mean(q[supported] <= args.visibility_q_min * (1 + 1e-6))),
+        "q_at_upper_bound_fraction": float(
+            np.mean(q[supported] >= args.visibility_q_max * (1 - 1e-6))),
         "corr_log_q_cn": q_cn_corr,
         "corr_pc1_q_signed": pc1_q_corr,
         "corr_pc1_q_abs": abs(pc1_q_corr),
@@ -354,6 +379,8 @@ def main():
           "iterations", visibility_fit.iterations,
           "converged", visibility_fit.converged)
     print("graph_visibility_row_cv", row_cv,
+          "holdout_cv_q1", holdout_cv_before,
+          "holdout_cv_fitted_q", holdout_cv_after,
           "corr_log_q_cn", q_cn_corr,
           "abs_corr_pc1_q", abs(pc1_q_corr))
 
