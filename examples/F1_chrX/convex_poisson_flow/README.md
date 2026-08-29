@@ -39,3 +39,9 @@ ext-dominated pixels sum(O)/sum(E)  0.6858
 
 These values are reported without post-hoc correction; this deliberately
 shows that the simplified physical expected currently overestimates contact.
+
+The primary 500-kb Pearson analysis is chromosome-arm specific. chrX p arm
+(`<58.1 Mb`) and q arm (`>=63.8 Mb`) interaction profiles are correlated
+separately. The 58.1--63.8 Mb centromere interval and every p-by-q correlation
+are stored and plotted as missing values rather than contributing to either
+arm.

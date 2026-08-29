@@ -32,7 +32,8 @@ RES = 50_000
 
 
 def aggregate_500kb(observed, expected, valid, graph_distance,
-                    min_compartment_distance_bp=2_000_000):
+                    chromosome=None, centromere_start_bp=58_100_000,
+                    centromere_end_bp=63_800_000):
     factor = 10
     n = int(np.ceil(len(valid) / factor))
     size = n * factor
@@ -43,8 +44,24 @@ def aggregate_500kb(observed, expected, valid, graph_distance,
     graph_pad[:len(valid), :len(valid)] = np.where(
         valid_grid, graph_distance, np.inf)
     graph_min = graph_pad.reshape(n, factor, n, factor).min(axis=(1, 3))
-    return coarse, compute_interaction_profile_correlation(
-        coarse, coarse_valid, log_transform=True), graph_min
+    if chromosome in ("X", "chrX"):
+        centers = (np.arange(n) + 0.5) * factor * RES
+        arms = np.full(n, "centromere", dtype=object)
+        arms[centers < centromere_start_bp] = "p"
+        arms[centers >= centromere_end_bp] = "q"
+        pearson = np.full((n, n), np.nan)
+        for arm in ("p", "q"):
+            indices = np.flatnonzero(arms == arm)
+            arm_valid = coarse_valid[indices]
+            arm_oe = coarse[np.ix_(indices, indices)]
+            arm_pearson = compute_interaction_profile_correlation(
+                arm_oe, arm_valid, log_transform=True)
+            pearson[np.ix_(indices, indices)] = arm_pearson
+    else:
+        arms = np.full(n, "whole", dtype=object)
+        pearson = compute_interaction_profile_correlation(
+            coarse, coarse_valid, log_transform=True)
+    return coarse, pearson, graph_min, arms
 
 
 def main():
@@ -82,6 +99,8 @@ def main():
     parser.add_argument("--visibility-tolerance", type=float, default=.01)
     parser.add_argument("--visibility-max-iterations", type=int, default=100)
     parser.add_argument("--visibility-loop-quantile", type=float, default=.995)
+    parser.add_argument("--centromere-start", type=int, default=58_100_000)
+    parser.add_argument("--centromere-end", type=int, default=63_800_000)
     args = parser.parse_args()
     input_dir = args.input_dir.resolve()
     output_dir = (args.output_dir or input_dir / "copy_flow_additive_oe").resolve()
@@ -183,8 +202,11 @@ def main():
     final_external_expected = final_pair_factor * result.external_expected
     usable = np.outer(valid, valid) & (final_expected > 0)
     oe = np.divide(raw, final_expected, out=np.zeros_like(raw), where=usable)
-    coarse, pearson, graph_distance_500kb = aggregate_500kb(
-        raw, final_expected, valid, result.min_graph_distance_bins)
+    coarse, pearson, graph_distance_500kb, pearson_arms = aggregate_500kb(
+        raw, final_expected, valid, result.min_graph_distance_bins,
+        chromosome=args.chrom,
+        centromere_start_bp=args.centromere_start,
+        centromere_end_bp=args.centromere_end)
     output_stem = args.chrom.replace("chr", "chr", 1)
     np.savez_compressed(output_dir / f"{output_stem}.copy_flow_additive.npz", oe=oe,
                         expected=final_expected,
@@ -199,6 +221,9 @@ def main():
                         total_copy_pairs=result.total_copy_pairs,
                         collision_floor=result.collision_floor,
                         oe_500kb=coarse, pearson_500kb=pearson,
+                        pearson_arms=pearson_arms,
+                        centromere_start_bp=args.centromere_start,
+                        centromere_end_bp=args.centromere_end,
                         baseline_decay=baseline_decay,
                         same_molecule_decay=same_decay,
                         min_graph_distance_bins=result.min_graph_distance_bins,
@@ -227,7 +252,9 @@ def main():
     axes[0, 0].set_title("copy-flow additive log2(O/E)")
     axes[0, 1].imshow(pearson, cmap="RdBu_r", vmin=-1, vmax=1, extent=extent,
                       interpolation="none")
-    axes[0, 1].set_title("500-kb Pearson")
+    pearson_title = ("500-kb Pearson (p/q arms separately)"
+                     if args.chrom in ("X", "chrX") else "500-kb Pearson")
+    axes[0, 1].set_title(pearson_title)
     cis_fraction=np.divide(result.cis_copy_pairs, result.total_copy_pairs,
                            out=np.zeros_like(result.cis_copy_pairs),
                            where=result.total_copy_pairs > 0)
@@ -250,7 +277,7 @@ def main():
     main_axes[0].set_title("graph-aware log2(O/E)")
     main_axes[1].imshow(pearson, cmap="RdBu_r", vmin=-1, vmax=1, extent=extent,
                         interpolation="none")
-    main_axes[1].set_title("standard 500-kb Pearson")
+    main_axes[1].set_title(pearson_title)
     for ax in main_axes:
         ax.set_xlabel(f"{args.chrom} position (Mb)")
         ax.set_ylabel(f"{args.chrom} position (Mb)")
