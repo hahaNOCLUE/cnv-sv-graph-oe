@@ -83,8 +83,19 @@ solution, deletion and inversion paths retain their physical orientation, and
 multiple alleles are summed rather than collapsed to one shortest path. Source
 or sink CN remains outside the derivative walks and therefore cannot create an
 SV contact contribution. The constant collision floor $B$ is estimated from
-graph-unconnected or genome-wide trans copy pairs; no CN exponent, compartment
-state, or freely fitted long-range bin effect enters the expected model.
+graph-unconnected or genome-wide trans copy pairs. The final normalization is
+a single graph-aware visibility model,
+
+$$
+\mu_{ij}=s q_iq_j E^G_{ij}.
+$$
+
+`cnv_latent_ssm.graph_visibility` estimates bounded technical visibility
+$0.5\le q_i\le2$ only from graph-supported cis pixels with contour distance
+0.5--5 Mb. SV-adjacent, centromeric, unresolved-topology, and extreme local
+enrichment pixels are excluded. Neither CN state nor reference long-range
+contacts enter this fit. There is no pre-graph ICE/LOIC step, no post-O/E ICE,
+and no additional CAIC-like CN-response layer.
 
 The older `compute_sv_distance_mixture_oe()` function is retained only for
 backward compatibility and hop-cap sensitivity diagnostics. It is not the

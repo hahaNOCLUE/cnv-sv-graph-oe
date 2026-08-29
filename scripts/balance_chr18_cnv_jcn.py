@@ -6,8 +6,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy import sparse
-from scipy.optimize import lsq_linear, minimize
+from scipy import linalg, sparse
+from scipy.optimize import Bounds, LinearConstraint, linprog, lsq_linear, minimize
 
 ORIENTATIONS = ("++", "+-", "-+", "--")
 
@@ -30,6 +30,8 @@ def get_args():
                    help="Optional reference-CN cap only at SV breakpoint boundaries")
     p.add_argument("--flow-weight", type=float, default=1e8,
                    help="Near-hard side-flow conservation weight")
+    p.add_argument("--hard-flow", action="store_true",
+                   help="Enforce side-flow conservation as exact linear constraints")
     p.add_argument("--source-penalty", type=float, default=1000.0,
                    help="L1 penalty for source flow at unresolved CN-step endpoints")
     p.add_argument("--foldback-source-penalty", type=float, default=10.0,
@@ -47,6 +49,10 @@ def get_args():
                    default="upper",
                    help="Treat CNV jumps as an upper guide, not forced SV dosage")
     p.add_argument("--poisson-weight",type=float,default=1.0)
+    p.add_argument("--junction-counts", type=Path,
+                   help="Generic orientation-aware local junction count table")
+    p.add_argument("--one-copy-junction-pairs", type=float,
+                   help="Expected local excess pairs contributed by JCN=1")
     p.add_argument("--junction-window",type=int,choices=(500,1000,1500,5000),default=None,
                    help="Use the matched small-window comparison counts")
     p.add_argument("--cnv-snap-tolerance",type=int,default=100_000)
@@ -214,7 +220,10 @@ def main():
                          if vertex >= 0}
     cn_step_vertices = set()
     for i in range(nr):
-        if abs(seq_cn[i + 1] - seq_cn[i]) >= a.cnv_snap_min_jump:
+        # Continuous CNS values need residual mass at every genuine dosage
+        # discontinuity.  cnv_snap_min_jump is only an SV-matching evidence
+        # threshold and must not decide flow feasibility.
+        if abs(seq_cn[i + 1] - seq_cn[i]) >= 1e-6:
             cn_step_vertices.update((2 * i + 1, 2 * (i + 1)))
     source_allowed = np.zeros(nv, dtype=bool)
     # A CN step is the explicit evidence that the supplied adjacency set does
@@ -223,20 +232,33 @@ def main():
     # breakends remain hard-zero.
     source_allowed[list(cn_step_vertices)] = True
     source_allowed[[0, nv - 1]] = True
+    # A called junction specifies one derivative adjacency at each breakend,
+    # but its reciprocal adjacency may be absent from the candidate set.  If
+    # the reciprocal side is forced to remain entirely reference-continuous,
+    # exact flow conservation algebraically forces the called JCN to zero.
+    # Represent that missing partner as a labelled latent endpoint rather than
+    # treating the observed junction as impossible.
+    reciprocal_latent_vertices=set()
     foldback_latent_vertices=set()
     for j,row in sv.iterrows():
-        if not bool(row.is_foldback):
-            continue
         for vertex in edge_vertices[j][:2]:
             if vertex < 0:
                 continue
             opposite = vertex - 1 if vertex % 2 == 0 else vertex + 1
             if 0 <= opposite < nv:
-                foldback_latent_vertices.add(opposite)
+                reciprocal_latent_vertices.add(opposite)
+                if bool(row.is_foldback):
+                    foldback_latent_vertices.add(opposite)
+    if reciprocal_latent_vertices:
+        source_allowed[list(reciprocal_latent_vertices)] = True
     if foldback_latent_vertices:
         source_allowed[list(foldback_latent_vertices)] = True
     source_weights = np.zeros(nv, dtype=float)
     source_weights[source_allowed] = a.source_penalty
+    if reciprocal_latent_vertices:
+        source_weights[list(reciprocal_latent_vertices)] = (
+            a.breakpoint_source_penalty
+        )
     if foldback_latent_vertices:
         source_weights[list(foldback_latent_vertices)] = a.foldback_source_penalty
     source_weights[[0, nv - 1]] = a.telomere_source_penalty
@@ -278,6 +300,28 @@ def main():
         beta_sv = 1.0
         ref_y = nominal_ref.copy()
         beta_ref = 1.0
+    elif a.junction_counts is not None:
+        if a.one_copy_junction_pairs is None or a.one_copy_junction_pairs <= 0:
+            raise ValueError("--one-copy-junction-pairs must be positive with --junction-counts")
+        counts = pd.read_csv(a.junction_counts, sep="\t")
+        count_lookup = {
+            (str(row.chrom1), int(row.pos1), str(row.chrom2), int(row.pos2)):
+            (float(row.junction_pairs), float(row.background_pairs))
+            for row in counts.itertuples()
+        }
+        selected_counts = [count_lookup.get(
+            (str(row.chrom1), int(row.pos1), str(row.chrom2), int(row.pos2)),
+            (0.0, 0.0)) for row in sv.iloc[:n_intra].itertuples()]
+        sv_y = np.asarray([item[0] for item in selected_counts], float)
+        # A zero-background local window is represented upstream by a tiny
+        # placeholder.  Using that value literally makes the Poisson Hessian
+        # singular at JCN=0.  One raw pair is a conservative pseudocount and
+        # leaves supported junction MLEs essentially unchanged.
+        sv_eta = np.maximum(
+            np.asarray([item[1] for item in selected_counts], float), 1.0)
+        beta_sv = float(a.one_copy_junction_pairs)
+        ref_y = nominal_ref.copy()
+        beta_ref = 1.0
     elif a.junction_window is not None:
         counts=pd.read_csv(calibration_dir/"F1_chr18.junction_window_comparison.tsv",sep="\t")
         counts=counts[counts.window_bp.eq(a.junction_window)].set_index("sv_id").loc[sv.sv_id.iloc[:n_intra]]
@@ -296,25 +340,33 @@ def main():
         beta_sv=float(depth_summary.loc["one_copy_junction_pairs"])
         ref_series=(pd.read_csv(a.outdir/"F1_chr18.reference_pair_counts.tsv",sep="\t")
                     .set_index("boundary").total_reference_pairs.reindex(starts[1:]))
-    if a.poisson_weight != 0:
+    if a.poisson_weight != 0 and a.junction_counts is None:
         observed_ref = ref_series.notna().to_numpy()
         beta_ref=float(np.median(ref_series.to_numpy(float)[observed_ref] /
                                  np.maximum(nominal_ref[observed_ref],.05)))
         ref_y=ref_series.fillna(pd.Series(beta_ref*nominal_ref,
                                           index=starts[1:])).to_numpy(float)
     def objective(x):
-        residual=dense@x-target_vector
+        if a.hard_flow:
+            residual=dense[nv:]@x-target_vector[nv:]
+            penalty_design=dense[nv:]
+        else:
+            residual=dense@x-target_vector
+            penalty_design=dense
         mu_sv=np.maximum(sv_eta+beta_sv*x[off_j:off_j+n_intra],1e-9)
         mu_ref=np.maximum(beta_ref*x[:off_j],1e-9)
-        value=.5*np.dot(residual,residual)+a.poisson_weight*(
-            np.sum(mu_sv-sv_y*np.log(mu_sv))+np.sum(mu_ref-ref_y*np.log(mu_ref)))
-        grad=dense.T@residual
+        poisson_value = np.sum(mu_sv-sv_y*np.log(mu_sv))
+        if a.junction_counts is None:
+            poisson_value += np.sum(mu_ref-ref_y*np.log(mu_ref))
+        value=.5*np.dot(residual,residual)+a.poisson_weight*poisson_value
+        grad=penalty_design.T@residual
         # Source is non-negative, so lambda*S is an exact L1 penalty. Unlike
         # L2, it does not reward spreading one unresolved copy over many sites.
         value += np.dot(source_weights, x[off_src:])
         grad[off_src:] += source_weights
         grad[off_j:off_j+n_intra]+=a.poisson_weight*beta_sv*(1-sv_y/mu_sv)
-        grad[:off_j]+=a.poisson_weight*beta_ref*(1-ref_y/mu_ref)
+        if a.junction_counts is None:
+            grad[:off_j]+=a.poisson_weight*beta_ref*(1-ref_y/mu_ref)
         if a.junction_target_mode == "upper":
             jcn = x[off_j:off_src]
             targets = np.asarray(junction_targets)
@@ -326,6 +378,27 @@ def main():
             junction_grad = grad[off_j:off_src]
             junction_grad[active] += weights[active] * excess[active]
         return value,grad
+    def objective_hessian(x):
+        penalty_design = dense[nv:] if a.hard_flow else dense
+        hessian = penalty_design.T @ penalty_design
+        mu_sv = np.maximum(sv_eta + beta_sv * x[off_j:off_j+n_intra], 1e-9)
+        diagonal = np.zeros(len(x), dtype=float)
+        diagonal[off_j:off_j+n_intra] += (
+            a.poisson_weight * beta_sv ** 2 * sv_y / mu_sv ** 2
+        )
+        if a.poisson_weight and a.junction_counts is None:
+            mu_ref = np.maximum(beta_ref * x[:off_j], 1e-9)
+            diagonal[:off_j] += a.poisson_weight * beta_ref ** 2 * ref_y / mu_ref ** 2
+        if a.junction_target_mode == "upper":
+            jcn = x[off_j:off_src]
+            targets = np.asarray(junction_targets)
+            active = (targets > 0) & (jcn > targets)
+            diagonal[off_j:off_src][active] += (
+                a.junction_target_weight
+                * np.maximum(sv.eaglec2_probability.to_numpy(float)[active], .05)
+            )
+        hessian.flat[::len(x) + 1] += diagonal
+        return hessian
     bounds=[(0,None)]*(off_src+nv)
     for i in range(nr):
         bounds[off_ref+i] = (0, ref_upper[i])
@@ -335,8 +408,89 @@ def main():
     for vertex in range(nv):
         if not source_allowed[vertex]:
             bounds[off_src + vertex] = (0, 0)
-    joint=minimize(objective,fit.x,jac=True,method="L-BFGS-B",bounds=bounds,
-                   options={"maxiter":5000,"ftol":1e-12,"gtol":1e-8,"maxls":50})
+    if a.hard_flow:
+        flow_matrix = dense[:nv] / fw
+        flow_target = target_vector[:nv] / fw
+        edge_flow = flow_matrix[:, :off_src]
+        edge_bounds = bounds[:off_src]
+        lower = np.asarray([item[0] for item in edge_bounds], float)
+        upper = np.asarray([
+            np.inf if item[1] is None else item[1] for item in edge_bounds
+        ], float)
+        fixed_rows = np.flatnonzero(~source_allowed)
+        slack_rows = np.flatnonzero(source_allowed)
+        equality_matrix = edge_flow[fixed_rows]
+        equality_target = flow_target[fixed_rows]
+        if len(fixed_rows):
+            _, triangular, pivots = linalg.qr(
+                equality_matrix.T, mode="economic", pivoting=True
+            )
+            diagonal = np.abs(np.diag(triangular))
+            rank = int(np.sum(diagonal > max(diagonal.max(initial=0) * 1e-10, 1e-12)))
+            independent = np.sort(pivots[:rank])
+            equality_matrix = equality_matrix[independent]
+            equality_target = equality_target[independent]
+
+        def reduced_objective(edge_x):
+            source_x = flow_target - edge_flow @ edge_x
+            full_x = np.concatenate([edge_x, source_x])
+            value, full_grad = objective(full_x)
+            reduced_grad = full_grad[:off_src] - edge_flow.T @ full_grad[off_src:]
+            return value, reduced_grad
+
+        def reduced_hessian(edge_x):
+            source_x = flow_target - edge_flow @ edge_x
+            full_x = np.concatenate([edge_x, source_x])
+            # Eliminating source variables applies the affine transform
+            # full_x = [I; -edge_flow] edge_x + [0; flow_target].  Retain the
+            # resulting edge/source curvature; taking only the upper-left
+            # block can strand strongly supported junctions at the zero bound.
+            transform = np.vstack((np.eye(off_src), -edge_flow))
+            full_hessian = objective_hessian(full_x)
+            return transform.T @ full_hessian @ transform
+
+        constraints = []
+        if len(equality_matrix):
+            constraints.append(LinearConstraint(
+                equality_matrix, equality_target, equality_target
+            ))
+        if len(slack_rows):
+            constraints.append(LinearConstraint(
+                edge_flow[slack_rows], np.zeros(len(slack_rows)),
+                flow_target[slack_rows]
+            ))
+        feasibility_cost = -(edge_flow.T @ source_weights)
+        # Break ties between equally source-efficient feasible solutions by
+        # placing a small amount of mass on higher-confidence junctions. This
+        # avoids starting the Poisson optimizer at an arbitrary all-zero JCN
+        # corner without changing the dominant source objective.
+        feasibility_cost[off_j:off_src] -= (
+            1e-3 * sv.eaglec2_probability.to_numpy(float)
+        )
+        feasible = linprog(
+            feasibility_cost,
+            A_ub=edge_flow[slack_rows] if len(slack_rows) else None,
+            b_ub=flow_target[slack_rows] if len(slack_rows) else None,
+            A_eq=equality_matrix if len(equality_matrix) else None,
+            b_eq=equality_target if len(equality_matrix) else None,
+            bounds=edge_bounds, method="highs",
+        )
+        if not feasible.success:
+            raise RuntimeError("hard-flow feasible point failed: " + feasible.message)
+        joint=minimize(
+            reduced_objective, feasible.x, jac=True, hess=reduced_hessian,
+            method="trust-constr", bounds=Bounds(lower, upper),
+            constraints=constraints,
+            options={"maxiter":2000, "gtol":1e-8, "xtol":1e-9,
+                     "barrier_tol":1e-9, "verbose":0},
+        )
+        if joint.success:
+            edge_x = joint.x
+            source_x = flow_target - edge_flow @ edge_x
+            joint.x = np.concatenate([edge_x, source_x])
+    else:
+        joint=minimize(objective,fit.x,jac=True,method="L-BFGS-B",bounds=bounds,
+                       options={"maxiter":5000,"ftol":1e-12,"gtol":1e-8,"maxls":50})
     if not joint.success: raise RuntimeError("joint Poisson balance failed: "+joint.message)
     x=joint.x; reference_cn=x[:off_j]; junction_cn=x[off_j:off_src]; source_cn=x[off_src:]
     flow_residual=design[:nv].dot(x)/fw-np.repeat(seq_cn,2)

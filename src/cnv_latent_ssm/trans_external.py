@@ -57,9 +57,13 @@ def fit_trans_external_from_cooler(
 
     available = [str(c) for c in clr.chromnames]
     if chromosomes is None:
+        def autosome_number(name: str):
+            label = name[3:] if name.startswith("chr") else name
+            return int(label) if label.isdigit() else None
+
         chromosomes = [c for c in available
-                       if c.startswith("chr") and c[3:].isdigit()
-                       and 1 <= int(c[3:]) <= 22]
+                       if autosome_number(c) is not None
+                       and 1 <= autosome_number(c) <= 22]
     chromosomes = [c for c in chromosomes if c in available]
     offsets = clr.offset
     chrom_data = {}
