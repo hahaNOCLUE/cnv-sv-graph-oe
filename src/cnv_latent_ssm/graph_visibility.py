@@ -121,6 +121,8 @@ def fit_graph_visibility(
     converged = False
 
     for iteration in range(1, max_iterations + 1):
+        previous_q = q.copy()
+        previous_scale = scale
         mu = scale * np.outer(q, q) * graph_expected
         observed_row = np.where(fit_mask, observed, 0).sum(axis=1)
         expected_row = np.where(fit_mask, mu, 0).sum(axis=1)
@@ -147,7 +149,14 @@ def fit_graph_visibility(
         denominator = (np.outer(q, q) * graph_expected)[fit_mask].sum()
         scale = float(observed[fit_mask].sum() / max(denominator, 1e-12))
         history.append((iteration, scale, max_error))
-        if max_error < tolerance:
+        parameter_error = max(
+            float(np.max(np.abs(np.log(q[usable] / previous_q[usable])))),
+            abs(float(np.log(scale / previous_scale))),
+        )
+        # With bounded q, row residuals can remain nonzero at the constrained
+        # optimum.  Treat a numerically stationary parameter vector as
+        # converged rather than exhausting max_iterations indefinitely.
+        if max_error < tolerance or parameter_error < 1e-8:
             converged = True
             break
 

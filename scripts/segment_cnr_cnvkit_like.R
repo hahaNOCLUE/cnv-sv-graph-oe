@@ -11,7 +11,11 @@ input <- args[[1]]
 output_cns <- args[[2]]
 output_cbs <- args[[3]]
 alpha <- if (length(args) >= 4L) as.numeric(args[[4]]) else 1e-4
-undo_sd <- if (length(args) >= 5L) as.numeric(args[[5]]) else 1
+undo_sd <- if (length(args) >= 5L) as.numeric(args[[5]]) else 2
+
+# DNAcopy uses permutations when testing change points.  Fix the seed so that
+# parameter sensitivity runs and complete pipeline reruns are reproducible.
+set.seed(1)
 
 bins <- read.delim(input, check.names = FALSE, stringsAsFactors = FALSE)
 required <- c("chromosome", "start", "end", "log2")
@@ -37,8 +41,7 @@ new.run <- c(TRUE,
 work$analysis.chromosome <- paste0(work$chromosome, "__run", cumsum(new.run))
 cna <- CNA(work$log2, work$analysis.chromosome, midpoint,
            data.type = "logratio", sampleid = "F1_10kb.continuous")
-smoothed <- smooth.CNA(cna, outlier.SD.scale = 3, smooth.SD.scale = 2)
-fit <- segment(smoothed, alpha = alpha, min.width = 2,
+fit <- segment(cna, weights = work$weight, alpha = alpha, min.width = 5,
                undo.splits = "sdundo", undo.SD = undo_sd,
                verbose = 1)
 seg <- fit$output

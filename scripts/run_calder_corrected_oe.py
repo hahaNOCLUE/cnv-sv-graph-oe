@@ -18,6 +18,12 @@ def main():
     p.add_argument("--rscript", default="Rscript")
     p.add_argument("--genome", default="hg38")
     p.add_argument("--cores", type=int, default=4)
+    p.add_argument("--start-bp", type=int, default=0,
+                   help="Inclusive chromosome-arm start in genomic coordinates")
+    p.add_argument("--end-bp", type=int,
+                   help="Exclusive chromosome-arm end in genomic coordinates")
+    p.add_argument("--label", default="",
+                   help="Output label such as p_arm or q_arm")
     args = p.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -29,10 +35,21 @@ def main():
     if observed.shape != expected.shape:
         raise ValueError("observed and expected matrices have different shapes")
 
+    chrom_end = observed.shape[0] * clr.binsize
+    end_bp = chrom_end if args.end_bp is None else min(args.end_bp, chrom_end)
+    start_bin = max(0, args.start_bp // clr.binsize)
+    end_bin = min(len(observed), (end_bp + clr.binsize - 1) // clr.binsize)
+    if end_bin <= start_bin:
+        raise ValueError("requested arm interval contains no bins")
+
     oe = np.divide(observed, expected, out=np.zeros_like(observed),
                    where=np.isfinite(expected) & (expected > 0))
-    eligible = np.outer(valid, valid) & np.isfinite(oe) & (oe > 0)
-    dump = args.output_dir / f"{args.chrom}.{clr.binsize}.corrected_oe.tsv.gz"
+    arm_bins = np.zeros(len(valid), dtype=bool)
+    arm_bins[start_bin:end_bin] = True
+    eligible = (np.outer(valid & arm_bins, valid & arm_bins)
+                & np.isfinite(oe) & (oe > 0))
+    suffix = f".{args.label}" if args.label else ""
+    dump = args.output_dir / f"{args.chrom}{suffix}.{clr.binsize}.corrected_oe.tsv.gz"
     with gzip.open(dump, "wt") as handle:
         for i in range(len(oe)):
             js = np.flatnonzero(eligible[i, i:]) + i

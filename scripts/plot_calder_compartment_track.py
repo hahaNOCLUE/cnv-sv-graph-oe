@@ -25,6 +25,9 @@ def main():
     p.add_argument("--chrom-end", type=int, required=True)
     p.add_argument("--centromere-start", type=int)
     p.add_argument("--centromere-end", type=int)
+    p.add_argument("--reference-bed", type=Path,
+                   help="Optional CALDER reference subcompartment BED")
+    p.add_argument("--reference-label", default="CALDER reference")
     args = p.parse_args()
 
     data = pd.read_csv(args.input, sep="\t")
@@ -46,8 +49,28 @@ def main():
     subcode = track["sub"].map(code).to_numpy(float)
     abcode = track.ab.map({"B": 0, "A": 1}).to_numpy(float)
 
-    fig, axes = plt.subplots(3, 1, figsize=(16, 6.8), sharex=True,
-                             gridspec_kw={"height_ratios": [4, 1, 1]},
+    reference_abcode = reference_subcode = None
+    if args.reference_bed is not None:
+        ref = pd.read_csv(args.reference_bed, sep="\t", header=None,
+                          usecols=[0, 1, 2, 3],
+                          names=["chr", "start", "end", "comp_name"])
+        ref = ref[ref.chr.eq(args.chrom)].copy()
+        ref["ab"] = ref.comp_name.str.split(".", regex=False).str[0]
+        ref["sub"] = ref.comp_name.str.split(".", regex=False).str[:2].str.join(".")
+        reference_abcode = np.full(n, np.nan)
+        reference_subcode = np.full(n, np.nan)
+        for row in ref.itertuples(index=False):
+            first = max(0, (int(row.start) - 1) // args.bin_size)
+            last = min(n - 1, (int(row.end) - 1) // args.bin_size)
+            if last < first:
+                continue
+            reference_abcode[first:last + 1] = {"B": 0, "A": 1}.get(row.ab, np.nan)
+            reference_subcode[first:last + 1] = code.get(row.sub, np.nan)
+
+    nrows = 5 if reference_abcode is not None else 3
+    heights = [4, 1, 1, 1, 1] if nrows == 5 else [4, 1, 1]
+    fig, axes = plt.subplots(nrows, 1, figsize=(16, 8.2 if nrows == 5 else 6.8), sharex=True,
+                             gridspec_kw={"height_ratios": heights},
                              constrained_layout=True)
     axes[0].axhline(0, color="0.45", lw=.8)
     axes[0].plot(x, track.signed_continuous, color="#222222", lw=.8)
@@ -66,7 +89,16 @@ def main():
                    cmap=ListedColormap(colors), vmin=0, vmax=3,
                    extent=(0, args.chrom_end/1e6, 0, 1))
     axes[2].set_yticks([.5], ["subcompartment"])
-    axes[2].set_xlabel(f"{args.chrom} position (Mb)")
+    if reference_abcode is not None:
+        axes[3].imshow(reference_abcode[None, :], aspect="auto", interpolation="none",
+                       cmap=ListedColormap(["#2166ac", "#d73027"]), vmin=0, vmax=1,
+                       extent=(0, args.chrom_end/1e6, 0, 1))
+        axes[3].set_yticks([.5], [f"{args.reference_label}\nA/B"])
+        axes[4].imshow(reference_subcode[None, :], aspect="auto", interpolation="none",
+                       cmap=ListedColormap(colors), vmin=0, vmax=3,
+                       extent=(0, args.chrom_end/1e6, 0, 1))
+        axes[4].set_yticks([.5], [f"{args.reference_label}\nsubcompartment"])
+    axes[-1].set_xlabel(f"{args.chrom} position (Mb)")
     for ax in axes:
         ax.set_xlim(0, args.chrom_end/1e6)
         if args.centromere_start is not None and args.centromere_end is not None:
@@ -74,7 +106,7 @@ def main():
                        color="0.55", alpha=.18, lw=0)
     handles = [plt.Line2D([0], [0], color=c, lw=7, label=l)
                for l, c in zip(labels, colors)]
-    axes[2].legend(handles=handles, ncol=4, loc="upper center",
+    axes[-1].legend(handles=handles, ncol=4, loc="upper center",
                    bbox_to_anchor=(.5, -.65), frameon=False)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=220)

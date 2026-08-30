@@ -33,14 +33,24 @@ def get_args():
                    help="Generic orientation-aware local junction count table")
     p.add_argument("--one-copy-junction-pairs", type=float,
                    help="Expected local excess pairs contributed by JCN=1")
+    p.add_argument("--cool-uri",
+                   help="50-kb COOL/MCOOL URI used to measure reference-adjacency support")
+    p.add_argument("--reference-window-bins", type=int, default=5,
+                   help="Bins on each side of a REF boundary; yields a square support window")
+    p.add_argument("--centromere-start", type=int)
+    p.add_argument("--centromere-end", type=int)
     p.add_argument("--cn-sigma-floor", type=float, default=.15,
                    help="Minimum uncertainty of each latent parent-segment CN")
     p.add_argument("--cn-sigma-scale", type=float, default=1.0,
                    help="Additional CN uncertainty, scaled by 1/sqrt(probes)")
+    p.add_argument("--fix-parent-cn", action="store_true",
+                   help="Hold parent CBS CN at its observed value during flow optimization")
     p.add_argument("--likelihood-tolerance", type=float, default=1.0,
                    help="Allowed likelihood increase during sparse-source stages")
     p.add_argument("--cnv-snap-tolerance",type=int,default=100_000)
     p.add_argument("--cnv-snap-min-jump",type=float,default=.25)
+    p.add_argument("--exclude-sv-id", action="append", default=[],
+                   help="Exclude an intra-chromosomal SV after stable SV IDs are assigned; repeatable")
     return p.parse_args()
 
 def endpoint_vertex(pos, strand, starts, ends):
@@ -66,6 +76,14 @@ def main():
     sv["orientation"] = probabilities.idxmax(axis=1)
     sv["eaglec2_probability"] = probabilities.max(axis=1)
     sv["sv_id"] = [f"SV{i+1:02d}" for i in range(len(sv))]
+    excluded = sv[sv.sv_id.isin(a.exclude_sv_id)].copy()
+    if a.exclude_sv_id:
+        missing = sorted(set(a.exclude_sv_id) - set(excluded.sv_id))
+        if missing:
+            raise ValueError(f"unknown --exclude-sv-id value(s): {', '.join(missing)}")
+        excluded.to_csv(a.outdir / "F1_chr18.manually_excluded_svs.tsv",
+                        sep="\t", index=False)
+        sv = sv[~sv.sv_id.isin(a.exclude_sv_id)].copy()
     sv["is_external"] = False
     sv["is_foldback"] = (sv.orientation.isin(("++", "--")) &
                          sv.eaglec2_probability.ge(a.foldback_min_probability))
@@ -291,6 +309,58 @@ def main():
     sv_y = np.asarray([item[0] for item in selected_counts], float)
     sv_eta = np.maximum(np.asarray([item[1] for item in selected_counts], float), 1.0)
     beta_sv = float(a.one_copy_junction_pairs)
+
+    # Measure REF support on exactly the same summed-pixel scale used by the
+    # SV junction-count table.  A w-bin left flank crossed with a w-bin right
+    # flank contributes w*w raw pixels.  No local background is subtracted:
+    # ordinary shifted boundaries are themselves true reference adjacencies.
+    if a.cool_uri is None:
+        raise ValueError("--cool-uri is required for the REF Poisson likelihood")
+    import cooler
+    clr = cooler.Cooler(a.cool_uri)
+    chrom_name = a.chrom if a.chrom in clr.chromnames else f"chr{a.chrom}"
+    if chrom_name not in clr.chromnames:
+        raise ValueError(f"{a.chrom} is absent from {a.cool_uri}")
+    chrom_bins = clr.bins().fetch(chrom_name).reset_index(drop=True)
+    chrom_matrix = np.asarray(clr.matrix(balance=False).fetch(chrom_name), float)
+    bin_starts = chrom_bins["start"].to_numpy(int)
+    bin_ends = chrom_bins["end"].to_numpy(int)
+    if "weight" in chrom_bins:
+        valid_cool_bins = np.isfinite(pd.to_numeric(
+            chrom_bins["weight"], errors="coerce").to_numpy(float))
+    else:
+        valid_cool_bins = np.ones(len(chrom_bins), dtype=bool)
+    ref_y = np.zeros(nr, float)
+    ref_likelihood_mask = np.zeros(nr, dtype=bool)
+    ref_support_rows = []
+    w = int(a.reference_window_bins)
+    if w < 1:
+        raise ValueError("--reference-window-bins must be positive")
+    for edge_index, (_, right) in enumerate(ref_pairs):
+        boundary = int(starts[right])
+        right_bin = int(np.searchsorted(bin_starts, boundary, side="left"))
+        left_idx = np.arange(right_bin - w, right_bin)
+        right_idx = np.arange(right_bin, right_bin + w)
+        in_range = (left_idx.min() >= 0
+                    and right_idx.max() < len(chrom_bins))
+        overlaps_centromere = (a.centromere_start is not None
+            and a.centromere_end is not None
+            and boundary - w * clr.binsize < a.centromere_end
+            and boundary + w * clr.binsize > a.centromere_start)
+        valid = bool(in_range and not overlaps_centromere)
+        if valid:
+            valid = bool(valid_cool_bins[left_idx].all()
+                         and valid_cool_bins[right_idx].all())
+        count = float(chrom_matrix[np.ix_(left_idx, right_idx)].sum()) if valid else np.nan
+        if valid and np.isfinite(count) and count > 0:
+            ref_y[edge_index] = count
+            ref_likelihood_mask[edge_index] = True
+        ref_support_rows.append({
+            "edge_id": f"REF{edge_index+1:03d}", "chrom": a.chrom,
+            "boundary": boundary, "reference_pairs": count,
+            "window_bins": w, "used_in_likelihood": bool(ref_likelihood_mask[edge_index]),
+            "excluded_centromere": bool(overlaps_centromere),
+        })
     bounds=[(0,None)]*(off_cn+nparent)
     for i in range(nr):
         if (a.reference_ploidy_cap is not None
@@ -362,17 +432,28 @@ def main():
     poisson_nll = cp.sum(
         poisson_mean - cp.multiply(sv_y, cp.log(poisson_mean))
     )
+    active_ref = np.flatnonzero(ref_likelihood_mask)
+    if not len(active_ref):
+        raise ValueError("no valid reference boundaries for the REF Poisson likelihood")
+    ref_poisson_mean = 1e-8 + beta_sv * cvx_x[off_ref + active_ref]
+    ref_poisson_nll = cp.sum(
+        ref_poisson_mean
+        - cp.multiply(ref_y[active_ref], cp.log(ref_poisson_mean))
+    )
     parent_observed = np.asarray([
         segments.loc[segments.parent_cnv_segment.eq(level), "sequence_cn"].iloc[0]
         for level in parent_levels], float)
+    if a.fix_parent_cn:
+        constraints.append(
+            cvx_x[off_cn:off_cn+nparent] == parent_observed)
     parent_probes = np.asarray([
         float(parent.loc[int(level.replace("CNSEG", "")) - 1, "probes"])
         if "probes" in parent.columns else 1.0 for level in parent_levels])
     parent_sigma = np.maximum(
         a.cn_sigma_floor, a.cn_sigma_scale / np.sqrt(np.maximum(parent_probes, 1)))
-    cn_nll = cp.sum(cp.abs(
-        (cvx_x[off_cn:off_cn+nparent] - parent_observed) / parent_sigma))
-    data_nll = cn_nll + poisson_nll
+    cn_nll = (cp.Constant(0.0) if a.fix_parent_cn else cp.sum(cp.abs(
+        (cvx_x[off_cn:off_cn+nparent] - parent_observed) / parent_sigma)))
+    data_nll = cn_nll + poisson_nll + ref_poisson_nll
 
     # Stage 1: obtain the best data fit with source available. Stage 2 then
     # finds the fewest loose-end locations inside a likelihood tolerance.
@@ -474,6 +555,13 @@ def main():
         "standardized_residual": (latent_parent_cn-parent_observed)/parent_sigma,
     }).to_csv(a.outdir/"F1_chr18.latent_parent_cn.tsv", sep="\t", index=False)
     ref_boundaries = np.asarray([starts[right] for _, right in ref_pairs])
+    for row, ref_cn in zip(ref_support_rows, reference_cn):
+        row["reference_cn"] = float(ref_cn)
+        row["poisson_expected_pairs"] = (
+            beta_sv * float(ref_cn) if row["used_in_likelihood"] else np.nan)
+    pd.DataFrame(ref_support_rows).to_csv(
+        a.outdir / "F1_chr18.reference_poisson_support.tsv",
+        sep="\t", index=False)
     pd.DataFrame({"edge_id":[f"REF{i+1:03d}" for i in range(nr)],"chrom":a.chrom,
         "boundary":ref_boundaries,"reference_cn":reference_cn}).to_csv(
         a.outdir/"F1_chr18.balanced_reference_cn.tsv",sep="\t",index=False)

@@ -1,0 +1,9 @@
+method	arm	pearson	spearman	ab_concordance
+graph_q1	p	0.361	0.285	0.696
+graph_q1	q	0.151	0.040	0.636
+graph_visibility	p	0.417704	0.345725	0.735497
+graph_visibility	q	0.245384	0.211433	0.678930
+cn_aware_raw_graph	p	0.425572	0.370800	0.732547
+cn_aware_raw_graph	q	0.257842	0.219838	0.686526
+ice_benchmark	p	0.415	0.357	0.687
+ice_benchmark	q	0.358	0.214	0.742
