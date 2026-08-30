@@ -27,7 +27,15 @@ work <- bins[usable, , drop = FALSE]
 if (!nrow(work)) stop("no usable bins")
 
 midpoint <- floor((work$start + work$end) / 2) + 1
-cna <- CNA(work$log2, work$chromosome, midpoint,
+# Treat coordinate gaps as independent segmentation runs. This prevents CBS
+# from creating one segment that bridges an excluded centromere.
+width <- work$end - work$start
+typical.width <- median(width[is.finite(width) & width > 0])
+new.run <- c(TRUE,
+             work$chromosome[-1] != work$chromosome[-nrow(work)] |
+             work$start[-1] - work$end[-nrow(work)] > 1.5 * typical.width)
+work$analysis.chromosome <- paste0(work$chromosome, "__run", cumsum(new.run))
+cna <- CNA(work$log2, work$analysis.chromosome, midpoint,
            data.type = "logratio", sampleid = "F1_10kb.continuous")
 smoothed <- smooth.CNA(cna, outlier.SD.scale = 3, smooth.SD.scale = 2)
 fit <- segment(smoothed, alpha = alpha, min.width = 2,
@@ -38,14 +46,14 @@ seg <- fit$output
 chrom_order <- unique(work$chromosome)
 rows <- vector("list", nrow(seg))
 for (i in seq_len(nrow(seg))) {
-  chrom <- as.character(seg$chrom[i])
-  local <- work$chromosome == chrom &
+  analysis.chrom <- as.character(seg$chrom[i])
+  local <- work$analysis.chromosome == analysis.chrom &
     midpoint >= seg$loc.start[i] & midpoint <= seg$loc.end[i]
   selected <- work[local, , drop = FALSE]
-  if (!nrow(selected)) stop("CBS segment has no matching bins: ", chrom, ":", seg$loc.start[i])
+  if (!nrow(selected)) stop("CBS segment has no matching bins: ", analysis.chrom, ":", seg$loc.start[i])
   w <- selected$weight
   rows[[i]] <- data.frame(
-    chromosome = chrom,
+    chromosome = as.character(selected$chromosome[1]),
     start = min(selected$start),
     end = max(selected$end),
     gene = "-",

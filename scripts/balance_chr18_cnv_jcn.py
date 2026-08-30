@@ -27,16 +27,18 @@ def get_args():
                    help="Optional upper bound on every reference-adjacency CN")
     p.add_argument("--breakpoint-reference-ploidy-cap", type=float, default=None,
                    help="Optional reference-CN cap only at SV breakpoint boundaries")
-    p.add_argument("--source-penalty", type=float, default=1000.0,
-                   help="L1 penalty for source flow at unresolved CN-step endpoints")
     p.add_argument("--foldback-min-probability", type=float, default=.9)
     p.add_argument("--foldback-dedup-distance", type=int, default=50_000)
-    p.add_argument("--telomere-source-penalty", type=float, default=0.0,
-                   help="Source penalty at chromosome telomeres")
     p.add_argument("--junction-counts", type=Path,
                    help="Generic orientation-aware local junction count table")
     p.add_argument("--one-copy-junction-pairs", type=float,
                    help="Expected local excess pairs contributed by JCN=1")
+    p.add_argument("--cn-sigma-floor", type=float, default=.15,
+                   help="Minimum uncertainty of each latent parent-segment CN")
+    p.add_argument("--cn-sigma-scale", type=float, default=1.0,
+                   help="Additional CN uncertainty, scaled by 1/sqrt(probes)")
+    p.add_argument("--likelihood-tolerance", type=float, default=1.0,
+                   help="Allowed likelihood increase during sparse-source stages")
     p.add_argument("--cnv-snap-tolerance",type=int,default=100_000)
     p.add_argument("--cnv-snap-min-jump",type=float,default=.25)
     return p.parse_args()
@@ -161,14 +163,21 @@ def main():
     segments = pd.DataFrame(records)
     starts, ends = segments.start.to_numpy(int), segments.end.to_numpy(int)
     seq_cn = segments.sequence_cn.to_numpy(float)
-    nseg, nv, nr, nj = len(segments), 2*len(segments), len(segments)-1, len(sv)
+    nseg, nv, nj = len(segments), 2*len(segments), len(sv)
+    ref_pairs = [(i, i + 1) for i in range(nseg - 1)
+                 if segments.chrom.iloc[i] == segments.chrom.iloc[i + 1]
+                 and int(ends[i]) == int(starts[i + 1])]
+    nr = len(ref_pairs)
 
-    # Variables are reference CN, junction CN and source CN; sequence CN is fixed.
+    # Variables are reference CN, junction CN, endpoint source and latent
+    # parent-CBS CN. Every graph cut from one parent shares the same CN.
     off_ref, off_j = 0, nr
     off_recip, off_src = nr + nj, nr + 3 * nj
+    off_cn = off_src + nv
     incident = [[] for _ in range(nv)]
-    for i in range(nr):
-        incident[2*i+1].append(off_ref+i); incident[2*(i+1)].append(off_ref+i)
+    for edge_index, (left, right) in enumerate(ref_pairs):
+        incident[2*left+1].append(off_ref+edge_index)
+        incident[2*right].append(off_ref+edge_index)
     edge_vertices = []
     junction_targets = []
     reciprocal_incident = [[] for _ in range(nv)]
@@ -215,19 +224,22 @@ def main():
     breakend_vertices = {vertex for edge in edge_vertices for vertex in edge[:2]
                          if vertex >= 0}
     cn_step_vertices = set()
-    for i in range(nr):
+    for i, (left, right) in enumerate(ref_pairs):
         # Continuous CNS values need residual mass at every genuine dosage
         # discontinuity.  cnv_snap_min_jump is only an SV-matching evidence
         # threshold and must not decide flow feasibility.
-        if abs(seq_cn[i + 1] - seq_cn[i]) >= 1e-6:
-            cn_step_vertices.update((2 * i + 1, 2 * (i + 1)))
+        if abs(seq_cn[right] - seq_cn[left]) >= 1e-6:
+            cn_step_vertices.update((2 * left + 1, 2 * right))
     source_allowed = np.zeros(nv, dtype=bool)
     # A CN step is the explicit evidence that the supplied adjacency set does
     # not fully explain dosage. Permit a labelled latent endpoint there even
     # when another paired SV touches the same side; all non-CN-step paired
     # breakends remain hard-zero.
     source_allowed[list(cn_step_vertices)] = True
-    source_allowed[[0, nv - 1]] = True
+    component_end_vertices = {vertex for vertex in range(nv)
+                              if not any(off_ref <= edge < off_j
+                                         for edge in incident[vertex])}
+    source_allowed[list(component_end_vertices)] = True
     foldback_latent_vertices=set()
     for j,row in sv.iterrows():
         for vertex in edge_vertices[j][:2]:
@@ -237,10 +249,6 @@ def main():
             if 0 <= opposite < nv:
                 if bool(row.is_foldback):
                     foldback_latent_vertices.add(opposite)
-    source_weights = np.zeros(nv, dtype=float)
-    source_weights[source_allowed] = a.source_penalty
-    source_weights[[0, nv - 1]] = a.telomere_source_penalty
-
     rr=[]; cc=[]; vv=[]; rhs=[]
     def add(coeffs,target):
         r=len(rhs)
@@ -250,19 +258,25 @@ def main():
     for vertex in range(nv):
         coeffs=([(edge,fw) for edge in incident[vertex]]
                 + [(edge,fw) for edge in reciprocal_incident[vertex]]
-                + [(off_src+vertex,fw)])
-        add(coeffs,fw*seq_cn[vertex//2])
-    design=sparse.csr_matrix((vv,(rr,cc)),shape=(len(rhs),off_src+nv))
+                + [(off_src+vertex,fw), (off_cn + segments.parent_cnv_segment
+                    .astype("category").cat.codes.iloc[vertex//2], -fw)])
+        add(coeffs, 0.0)
+    parent_codes = segments.parent_cnv_segment.astype("category").cat.codes.to_numpy()
+    parent_levels = list(segments.parent_cnv_segment.astype("category").cat.categories)
+    nparent = len(parent_levels)
+    design=sparse.csr_matrix((vv,(rr,cc)),shape=(len(rhs),off_cn+nparent))
     dense=design.toarray(); target_vector=np.asarray(rhs)
-    ref_upper = np.minimum(seq_cn[:-1], seq_cn[1:])
+    ref_upper = np.asarray([min(seq_cn[left], seq_cn[right])
+                            for left, right in ref_pairs])
     if a.reference_ploidy_cap is not None:
         ref_upper = np.minimum(ref_upper, a.reference_ploidy_cap)
     if a.breakpoint_reference_ploidy_cap is not None:
-        breakpoint_boundary = np.isin(starts[1:], endpoint_values)
+        breakpoint_boundary = np.isin(
+            [starts[right] for _, right in ref_pairs], endpoint_values)
         ref_upper[breakpoint_boundary] = np.minimum(
             ref_upper[breakpoint_boundary], a.breakpoint_reference_ploidy_cap)
     if a.junction_counts is None:
-        raise ValueError("--junction-counts is required by the fixed Poisson model")
+        raise ValueError("--junction-counts is required by the shared-yield Poisson model")
     if a.one_copy_junction_pairs is None or a.one_copy_junction_pairs <= 0:
         raise ValueError("--one-copy-junction-pairs must be a fixed positive constant")
     counts = pd.read_csv(a.junction_counts, sep="\t")
@@ -277,28 +291,28 @@ def main():
     sv_y = np.asarray([item[0] for item in selected_counts], float)
     sv_eta = np.maximum(np.asarray([item[1] for item in selected_counts], float), 1.0)
     beta_sv = float(a.one_copy_junction_pairs)
-    bounds=[(0,None)]*(off_src+nv)
+    bounds=[(0,None)]*(off_cn+nparent)
     for i in range(nr):
-        bounds[off_ref+i] = (0, ref_upper[i])
+        if (a.reference_ploidy_cap is not None
+                or a.breakpoint_reference_ploidy_cap is not None):
+            bounds[off_ref+i] = (0, ref_upper[i])
     for j,(_,_,b1,b2,_,_,_,_) in enumerate(edge_vertices):
-        capacity = seq_cn[b1] if b2 < 0 else min(seq_cn[b1],seq_cn[b2])
-        bounds[off_j+j]=(0,capacity)
+        bounds[off_j+j]=(0,None)
         for endpoint_index, vertex in enumerate(edge_vertices[j][:2]):
             reciprocal_index = off_recip + 2 * j + endpoint_index
             if vertex < 0:
                 bounds[reciprocal_index] = (0, 0)
                 continue
             opposite = vertex - 1 if vertex % 2 == 0 else vertex + 1
-            opposite_capacity = seq_cn[opposite // 2]
-            bounds[reciprocal_index] = (0, opposite_capacity)
+            bounds[reciprocal_index] = (0, None)
     for vertex in range(nv):
         if not source_allowed[vertex]:
             bounds[off_src + vertex] = (0, 0)
-    # Fixed convex model:
+    # Shared-yield Poisson component:
     #   Y_e ~ Poisson(a * J_e + b_e)
-    # with one shared a, hard side-flow conservation, non-negative flows and
-    # L1 source mass. CN-derived JCN targets and EagleC probabilities do not
-    # enter this objective. EagleC is only the candidate-edge generator.
+    # with one shared a, hard side-flow conservation and non-negative flows.
+    # CN-derived JCN targets and EagleC probabilities do not enter the data
+    # likelihood. EagleC is only the candidate-edge generator.
     try:
         import cvxpy as cp
     except ImportError as exc:
@@ -306,7 +320,7 @@ def main():
             "CVXPY is required; run this script in the graph-flow-cvxpy conda environment"
         ) from exc
 
-    variable_count = off_src + nv
+    variable_count = off_cn + nparent
     cvx_x = cp.Variable(variable_count, nonneg=True)
     flow_matrix = dense[:nv] / fw
     flow_target = target_vector[:nv] / fw
@@ -315,23 +329,111 @@ def main():
         if upper_bound is not None and np.isfinite(upper_bound):
             constraints.append(cvx_x[index] <= float(upper_bound))
 
-    # The simplified model has only REF, JCN and endpoint source variables.
-    # Legacy reciprocal-continuation slots are fixed to zero and cannot alter
-    # the feasible graph or provide candidate-dependent source freedom.
-    constraints.append(cvx_x[off_recip:off_src] == 0)
+    # Edge flow cannot exceed the latent CN of either incident parent segment.
+    for edge_index, (left, right) in enumerate(ref_pairs):
+        constraints.extend([
+            cvx_x[off_ref + edge_index] <= cvx_x[off_cn + parent_codes[left]],
+            cvx_x[off_ref + edge_index] <= cvx_x[off_cn + parent_codes[right]],
+        ])
+    for j, (_, _, b1, b2, _, _, _, _) in enumerate(edge_vertices):
+        constraints.append(cvx_x[off_j + j] <= cvx_x[off_cn + parent_codes[b1]])
+        if b2 >= 0:
+            constraints.append(
+                cvx_x[off_j + j] <= cvx_x[off_cn + parent_codes[b2]])
+        for endpoint_index, vertex in enumerate(edge_vertices[j][:2]):
+            if vertex < 0:
+                continue
+            opposite = vertex - 1 if vertex % 2 == 0 else vertex + 1
+            constraints.append(
+                cvx_x[off_recip + 2*j + endpoint_index]
+                <= cvx_x[off_cn + parent_codes[opposite // 2]])
+
+    # A called adjacency can leave the reciprocal side of either breakpoint
+    # unresolved when the companion derivative adjacency is absent from the
+    # candidate graph.  Such continuation is edge-specific and may exist only
+    # to the extent that the corresponding junction is used.  Consequently an
+    # unused candidate (J_e = 0) cannot open free source capacity.
+    for j in range(nj):
+        for endpoint_index in range(2):
+            reciprocal_index = off_recip + 2 * j + endpoint_index
+            constraints.append(cvx_x[reciprocal_index] <= cvx_x[off_j + j])
 
     poisson_mean = sv_eta + beta_sv * cvx_x[off_j:off_j+n_intra]
     poisson_nll = cp.sum(
         poisson_mean - cp.multiply(sv_y, cp.log(poisson_mean))
     )
-    source_nll = source_weights @ cvx_x[off_src:]
-    problem = cp.Problem(cp.Minimize(poisson_nll + source_nll), constraints)
-    installed = cp.installed_solvers()
-    solver = "CLARABEL" if "CLARABEL" in installed else "SCS"
-    solve_kwargs = {"solver": solver, "verbose": False}
-    if solver == "SCS":
-        solve_kwargs.update({"eps": 1e-7, "max_iters": 200000})
-    problem.solve(**solve_kwargs)
+    parent_observed = np.asarray([
+        segments.loc[segments.parent_cnv_segment.eq(level), "sequence_cn"].iloc[0]
+        for level in parent_levels], float)
+    parent_probes = np.asarray([
+        float(parent.loc[int(level.replace("CNSEG", "")) - 1, "probes"])
+        if "probes" in parent.columns else 1.0 for level in parent_levels])
+    parent_sigma = np.maximum(
+        a.cn_sigma_floor, a.cn_sigma_scale / np.sqrt(np.maximum(parent_probes, 1)))
+    cn_nll = cp.sum(cp.abs(
+        (cvx_x[off_cn:off_cn+nparent] - parent_observed) / parent_sigma))
+    data_nll = cn_nll + poisson_nll
+
+    # Stage 1: obtain the best data fit with source available. Stage 2 then
+    # finds the fewest loose-end locations inside a likelihood tolerance.
+    stage1 = cp.Problem(cp.Minimize(data_nll), constraints)
+    stage1.solve(solver="CLARABEL", verbose=False)
+    if stage1.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+        raise RuntimeError(f"stage-1 latent-CN/Poisson fit failed: {stage1.status}")
+    minimum_data_nll = float(stage1.value)
+    stage1_source = np.asarray(cvx_x.value[off_src:off_cn]).reshape(-1)
+    allowed_vertices = np.asarray(sorted(
+        {int(v) for v in np.flatnonzero(stage1_source > 1e-6)}
+        - component_end_vertices), int)
+    print(f"stage1 source-support candidates: {len(allowed_vertices)}", flush=True)
+    base_sparse_constraints = list(constraints)
+    base_sparse_constraints.append(
+        data_nll <= minimum_data_nll + a.likelihood_tolerance)
+    candidate_set = set(map(int, allowed_vertices))
+    screened_out = (set(np.flatnonzero(source_allowed))
+                    - candidate_set - component_end_vertices)
+    fixed_zero = set(map(int, screened_out))
+    # Deterministic lexicographic backward elimination. A location is removed
+    # only when the exact Poisson+CN likelihood tolerance and hard flow remain
+    # feasible. Repeat passes until the support is inclusion-minimal.
+    while True:
+        removed = 0
+        order = sorted(candidate_set,
+                       key=lambda v: (stage1_source[v], v))
+        for vertex in order:
+            trial_zero = fixed_zero | {vertex}
+            trial_constraints = (base_sparse_constraints
+                + [cvx_x[off_src + v] == 0 for v in sorted(trial_zero)])
+            trial = cp.Problem(cp.Minimize(cp.sum(cvx_x[off_src:off_cn])),
+                               trial_constraints)
+            try:
+                trial.solve(solver="CLARABEL", verbose=False)
+            except cp.error.SolverError:
+                continue
+            trial_x = (None if cvx_x.value is None else
+                       np.asarray(cvx_x.value).reshape(-1))
+            likelihood_ok = (data_nll.value is not None
+                and np.isfinite(data_nll.value)
+                and data_nll.value <= minimum_data_nll
+                    + a.likelihood_tolerance + 1e-4)
+            flow_ok = (trial_x is not None and np.max(np.abs(
+                flow_matrix @ trial_x - flow_target)) <= 1e-5)
+            if (trial.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                    and likelihood_ok and flow_ok):
+                fixed_zero.add(vertex)
+                candidate_set.remove(vertex)
+                removed += 1
+        print(f"source backward-elimination pass: retained={len(candidate_set)} "
+              f"removed={removed}", flush=True)
+        if removed == 0:
+            break
+    final_constraints = (base_sparse_constraints
+        + [cvx_x[off_src + v] == 0 for v in sorted(fixed_zero)])
+    stage3 = cp.Problem(cp.Minimize(cp.sum(cvx_x[off_src:off_cn])),
+                        final_constraints)
+    stage3.solve(solver="CLARABEL", verbose=False)
+    problem = stage3
+    solver = "CLARABEL"
     if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
         raise RuntimeError(f"convex Poisson hard-flow balance failed: {problem.status}")
 
@@ -340,7 +442,7 @@ def main():
     joint = ConvexResult()
     joint.x = np.asarray(cvx_x.value, dtype=float).reshape(-1)
     joint.success = True
-    joint.message = f"CVXPY {solver}: {problem.status}"
+    joint.message = f"CVXPY lexicographic {solver}: {problem.status}"
     joint.fun = float(problem.value)
 
     if not joint.success: raise RuntimeError("joint Poisson balance failed: "+joint.message)
@@ -348,8 +450,10 @@ def main():
     reference_cn=x[:off_j]
     junction_cn=x[off_j:off_recip]
     reciprocal_cn=x[off_recip:off_src]
-    source_cn=x[off_src:]
-    flow_residual=design[:nv].dot(x)/fw-np.repeat(seq_cn,2)
+    source_cn=x[off_src:off_cn]
+    latent_parent_cn=x[off_cn:off_cn+nparent]
+    seq_cn = latent_parent_cn[parent_codes]
+    flow_residual=design[:nv].dot(x)/fw
     reciprocal_source_cn = np.zeros(nv, float)
     for vertex, edges in enumerate(reciprocal_incident):
         reciprocal_source_cn[vertex] = sum(
@@ -358,10 +462,20 @@ def main():
     reciprocal_latent_vertices = {
         vertex for vertex, edges in enumerate(reciprocal_incident) if edges}
 
-    segments["balanced_sequence_cn"]=segments.sequence_cn
+    segments["observed_sequence_cn"] = segments.sequence_cn
+    segments["sequence_cn"] = seq_cn
+    segments["balanced_sequence_cn"] = seq_cn
     segments.to_csv(a.outdir/"F1_chr18.balanced_sequence_cn.tsv",sep="\t",index=False)
+    pd.DataFrame({
+        "parent_cnv_segment": parent_levels,
+        "observed_cn": parent_observed,
+        "latent_cn": latent_parent_cn,
+        "sigma_cn": parent_sigma,
+        "standardized_residual": (latent_parent_cn-parent_observed)/parent_sigma,
+    }).to_csv(a.outdir/"F1_chr18.latent_parent_cn.tsv", sep="\t", index=False)
+    ref_boundaries = np.asarray([starts[right] for _, right in ref_pairs])
     pd.DataFrame({"edge_id":[f"REF{i+1:03d}" for i in range(nr)],"chrom":a.chrom,
-        "boundary":starts[1:],"reference_cn":reference_cn}).to_csv(
+        "boundary":ref_boundaries,"reference_cn":reference_cn}).to_csv(
         a.outdir/"F1_chr18.balanced_reference_cn.tsv",sep="\t",index=False)
     out=[]
     for j,row in sv.iterrows():
@@ -377,7 +491,7 @@ def main():
             "junction_cn":junction_cn[j],"endpoint_cn_capacity":cap,
             "reciprocal_source1_cn":reciprocal_cn[2*j],
             "reciprocal_source2_cn":reciprocal_cn[2*j+1],
-            "cnv_breakpoint_target_cn":junction_targets[j],
+            "observed_cn_jump_diagnostic":junction_targets[j],
             "junction_pairs":observed_pairs,"junction_window_bp":50000,"poisson_background_eta":background_eta,
             "sv_reads_per_cn":beta_sv if j < n_intra else np.nan,
             "poisson_expected_pairs":background_eta+beta_sv*junction_cn[j] if j < n_intra else np.nan,
@@ -404,27 +518,27 @@ def main():
         "connected_fraction": np.divide(
             side_connected, np.repeat(seq_cn, 2),
             out=np.zeros(nv), where=np.repeat(seq_cn, 2) > 0),
-        "source_penalty": source_weights,
         "source_allowed": source_allowed,
         "is_unresolved_cn_step": [v in cn_step_vertices for v in range(nv)],
         "is_sv_breakend": [v in breakend_vertices for v in range(nv)],
         "is_reciprocal_latent_side": [v in reciprocal_latent_vertices
                                        for v in range(nv)],
-        "is_telomere": [v in (0, nv - 1) for v in range(nv)],
+        "is_telomere": [v in component_end_vertices for v in range(nv)],
     })
     side_qc.to_csv(a.outdir/"F1_chr18.connected_copy_fraction.tsv",
                    sep="\t", index=False)
-    boundary_capacity = np.minimum(seq_cn[:-1], seq_cn[1:])
+    boundary_capacity = np.asarray([min(seq_cn[left], seq_cn[right])
+                                    for left, right in ref_pairs])
     boundary_qc = pd.DataFrame({
         "edge_id": [f"REF{i+1:03d}" for i in range(nr)],
         "chrom": a.chrom,
-        "boundary": starts[1:],
+        "boundary": ref_boundaries,
         "reference_cn": reference_cn,
         "boundary_capacity_cn": boundary_capacity,
         "reference_continuity_ratio": np.divide(
             reference_cn, boundary_capacity, out=np.zeros(nr),
             where=boundary_capacity > 0),
-        "is_sv_breakpoint": np.isin(starts[1:], endpoint_values),
+        "is_sv_breakpoint": np.isin(ref_boundaries, endpoint_values),
     })
     boundary_qc.to_csv(a.outdir/"F1_chr18.reference_continuity_qc.tsv",
                        sep="\t", index=False)
@@ -457,8 +571,13 @@ def main():
     bins=bins[bins.chromosome.astype(str).eq(a.chrom)].copy()
     bins["copy_number"]=a.ploidy*np.exp2(pd.to_numeric(bins.log2,errors="coerce"))
     centers=(bins.start.to_numpy(float)+bins.end.to_numpy(float))/(2e6)
+    parent["observed_copy_number"] = parent.copy_number
+    for parent_index, level in enumerate(parent_levels):
+        original_index = int(level.replace("CNSEG", "")) - 1
+        parent.loc[original_index, "copy_number"] = latent_parent_cn[parent_index]
     normal_cn=bins.copy_number.replace([np.inf,-np.inf],np.nan).dropna().to_numpy(float)
-    ymax=max(3.0,float(np.nanmax(normal_cn))*1.08,float(parent.copy_number.max())*1.15)
+    ymax=max(3.0,float(np.nanpercentile(normal_cn, 99.5))*1.08,
+             float(parent.copy_number.max())*1.15)
     visible=bins.copy_number.le(ymax)
     bin_size_kb = int(round(np.median(bins.end.to_numpy(float) -
                                       bins.start.to_numpy(float)) / 1000))
@@ -500,20 +619,25 @@ def main():
     fig.tight_layout(); fig.savefig(a.outdir/"F1_chr18.cnv_jcn_balance.png",dpi=220); plt.close(fig)
     with (a.outdir/"F1_chr18.balance_summary.txt").open("w") as f:
         f.write("sequence_cn_source\tCNVkit CBS .cns\nsequence_cn_conversion\tCN=ploidy*2^log2\n")
-        f.write(f"nominal_ploidy\t{a.ploidy}\nreference_ploidy_cap\t{a.reference_ploidy_cap}\nbreakpoint_reference_ploidy_cap\t{a.breakpoint_reference_ploidy_cap}\nsequence_cn_optimization\tfixed\nsv_read_likelihood\tPoisson\n")
+        f.write(f"nominal_ploidy\t{a.ploidy}\nreference_ploidy_cap\t{a.reference_ploidy_cap}\nbreakpoint_reference_ploidy_cap\t{a.breakpoint_reference_ploidy_cap}\nsequence_cn_optimization\tlatent_parent_CBS_CN\nsv_read_likelihood\tPoisson\n")
         f.write(f"chromosome\t{a.chrom}\nparent_cnv_segments\t{len(parent)}\ngraph_sequence_segments\t{nseg}\nsv_edges\t{nj}\nintrachrom_sv_edges\t{n_intra}\ninterchrom_sv_edges\t{nj-n_intra}\n")
         f.write(f"cnv_snap_tolerance_bp\t{a.cnv_snap_tolerance}\ncnv_snap_min_jump\t{a.cnv_snap_min_jump}\ncnv_snapped_boundaries\t{len(snap_rows)}\n")
-        f.write("optimization_model\tconvex_shared-yield Poisson hard-flow\n")
-        f.write("objective\tPoisson_NLL_plus_L1_source\n")
+        f.write("optimization_model\tlexicographic_latent_CN_Poisson_hard_flow_sparse_source\n")
+        f.write("objective\tstage1_CN_Laplace_plus_Poisson;stage2_min_source_locations;stage3_min_source_mass\n")
         f.write("flow_conservation\thard_equality\n")
         f.write("eaglec_probability_role\tcandidate_selection_only\n")
         f.write("cn_junction_target\tdisabled\n")
-        f.write("reciprocal_continuation\tdisabled_fixed_zero\n")
-        f.write(f"source_penalty\t{a.source_penalty}\n")
-        f.write("source_penalty_form\tL1\nordinary_internal_source\thard_zero\nnon_cn_step_paired_breakend_source\thard_zero\ncn_step_latent_endpoint\tallowed_L1\n")
-        f.write(f"telomere_source_penalty\t{a.telomere_source_penalty}\n")
+        f.write("reciprocal_continuation\tSV_tied_0_le_U_le_JCN\n")
+        f.write(f"likelihood_tolerance\t{a.likelihood_tolerance}\n")
+        f.write("source_penalty_form\tlocation_sparsity_then_mass\n")
+        f.write("source_location_solver\tlikelihood-constrained_backward_elimination\n")
+        f.write("ordinary_internal_source\thard_zero\nnon_cn_step_paired_breakend_source\thard_zero\ncn_step_latent_endpoint\tallowed_sparse\n")
         f.write(f"junction_window_bp\t50000\nshared_junction_yield_a\t{beta_sv}\nbackground_model\tlocal_background_pairs\n")
-        f.write(f"solver_status\t{joint.message}\nobjective_value\t{joint.fun:.10g}\nmax_flow_residual_cn\t{np.max(np.abs(flow_residual)):.10g}\n")
+        f.write(f"solver_status\t{joint.message}\nstage1_minimum_data_nll\t{minimum_data_nll:.10g}\nobjective_value\t{joint.fun:.10g}\nmax_flow_residual_cn\t{np.max(np.abs(flow_residual)):.10g}\n")
+        active_unresolved = sum(source_cn[v] > 1e-6 for v in range(nv)
+                                if v not in component_end_vertices)
+        f.write(f"active_unresolved_source_locations\t{active_unresolved}\n")
+        f.write(f"max_abs_latent_cn_shift\t{np.max(np.abs(latent_parent_cn-parent_observed)):.10g}\n")
         f.write(f"total_junction_cn\t{junction_cn.sum():.10g}\ntotal_source_cn\t{total_source_cn.sum():.10g}\n")
         f.write(f"total_generic_source_cn\t{source_cn.sum():.10g}\n")
         f.write(f"total_reciprocal_source_cn\t{reciprocal_source_cn.sum():.10g}\n")

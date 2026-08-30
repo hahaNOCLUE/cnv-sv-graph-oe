@@ -1,0 +1,5 @@
+graph_fingerprint	role	path	md5	scale_cn	embed_loops
+74330a66b69f79068be1bc0e89802a3d	sequence	/home/dell/a1/microc/Fadu/graph_oe_continuous_neoloop_cnv/latent_cn_sparse_source/balance/F1_chr18.balanced_sequence_cn.tsv	852de54cb31290cc6ecdaa778a00c669	100	TRUE
+74330a66b69f79068be1bc0e89802a3d	reference	/home/dell/a1/microc/Fadu/graph_oe_continuous_neoloop_cnv/latent_cn_sparse_source/balance/F1_chr18.balanced_reference_cn.tsv	5a551fc71f7aed2ad332298097592573	100	TRUE
+74330a66b69f79068be1bc0e89802a3d	junction	/home/dell/a1/microc/Fadu/graph_oe_continuous_neoloop_cnv/latent_cn_sparse_source/balance/F1_chr18.balanced_junction_cn.tsv	6ef1741672e07c1681c883a335f93ee5	100	TRUE
+74330a66b69f79068be1bc0e89802a3d	source	/home/dell/a1/microc/Fadu/graph_oe_continuous_neoloop_cnv/latent_cn_sparse_source/balance/F1_chr18.source_slack_cn.tsv	5455b846e744552ab9abc1f150c6a4c4	100	TRUE
